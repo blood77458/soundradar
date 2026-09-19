@@ -8,7 +8,15 @@
 
 ## 下载就能用
 
-从 [Releases](https://github.com/blood77458/soundradar/releases) 下载 `soundradar.exe`，放到一个单独的文件夹里。它是命令行程序，在该文件夹打开 PowerShell：
+从 [Releases](https://github.com/blood77458/soundradar/releases) 下载 `soundradar-windows.zip`，解压到一个单独的文件夹。压缩包里已经有程序和一份声纹库：
+
+```
+soundradar.exe
+data\library.srz
+data\index.bin
+```
+
+在该文件夹打开 PowerShell：
 
 ```powershell
 .\soundradar.exe serve --overlay --open
@@ -20,9 +28,9 @@
 - **F8** 把刚才大约 3 秒存进「候选项」。游戏里做完动作、听到那一声之后再按。
 - 管理页面的「候选项」里试听、起名、配图标，然后新建条目或追加到已有条目。
 - 采集设备默认是系统当前的播放设备。耳机名字不对时，到管理页面的「设置」里改。设置写在 exe 旁边的 `config.json`，第一次运行会自己生成。
-- 声纹库存成 exe 旁边的 `data\library.srz`。这是你自己的录音，丢了就没了，和程序分开备份。
+- 声纹库是 exe 旁边的 `data\library.srz`。压缩包里的这份可以直接用来认。你后来自己录的条目也写在这个文件里，换电脑时单独备份它。索引 `data\index.bin` 可以随时重算，库比索引新时，下次开始实时识别会自动重建。
 
-索引 `data\index.bin` 不用备份。库比索引新的时候，下次开始实时识别会自动重算。
+自带库里现有这些声音：脑电接收装置-拖动，卡莫纳之星-拖动，金狮子-拖动，天命泥板-拖动、天命泥板-放下，古董茶壶-拿起、古董茶壶-放下，目标定位-拿起、目标定位-放下，琥珀天心-拿起、琥珀天心-放下。游戏里的声音和录音环境不完全一样，认不出的用 F8 再补一条即可。
 
 ## 录入时注意
 
@@ -58,7 +66,7 @@ cd soundradar
 
 下面这些是本机用的，没有放进仓库，也没有放进 Release：
 
-- `library.srz` 和 F8 候选项：你自己录的声音
+- F8 还没入库的候选项
 - `config.json`：这台电脑的播放设备和悬浮窗位置
 - `bin\` 里的 exe：只在 Release 里提供
 - `.gocache`、`.gopath`：编译缓存，`build.ps1` 会重新拉

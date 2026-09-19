@@ -9,12 +9,11 @@ soundradar/artifacts/
 
 # Binaries and this machine's runtime data.
 # The executable is published as a GitHub Release, not committed.
-# library.srz is the personal sound library (your own recordings).
 # config.json names the local playback device and overlay position.
+# F8 candidates are temporary inbox clips, not the published library.
 soundradar/bin/
-soundradar/data/
+soundradar/data/candidates/
 *.exe
-*.srz
 *.bak
 
 # Local migration kit. It packs chat sessions and login credentials.
