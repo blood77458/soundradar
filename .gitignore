@@ -1,0 +1,26 @@
+# Go caches. build.ps1 recreates these from goproxy.cn.
+.gocache/
+.gopath/
+
+# Abandoned WebView2 experiments and local verification dumps.
+spike/
+artifacts/
+soundradar/artifacts/
+
+# Binaries and this machine's runtime data.
+# The executable is published as a GitHub Release, not committed.
+# library.srz is the personal sound library (your own recordings).
+# config.json names the local playback device and overlay position.
+soundradar/bin/
+soundradar/data/
+*.exe
+*.srz
+*.bak
+
+# Local migration kit. It packs chat sessions and login credentials.
+迁移打包.ps1
+新电脑部署.md
+
+# OS junk
+Thumbs.db
+Desktop.ini

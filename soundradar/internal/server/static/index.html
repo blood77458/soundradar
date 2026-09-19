@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SoundRadar 音效库管理</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">◉</span>
+      <div>
+        <h1>SoundRadar 音效库</h1>
+        <div class="sub" id="libName">正在加载…</div>
+      </div>
+    </div>
+    <div class="stats" id="stats">
+      <div class="stat"><label>库文件</label><span id="statPath" class="mono">—</span></div>
+      <div class="stat"><label>条目总数</label><span id="statItems">—</span></div>
+      <div class="stat"><label>库文件大小</label><span id="statSize">—</span></div>
+      <div class="stat"><label>样本总数</label><span id="statSamples">—</span></div>
+    </div>
+    <div class="actions">
+      <nav class="tabs" id="tabs">
+        <a class="tab" id="tabLib" href="#/">音效库</a>
+        <a class="tab" id="tabLive" href="#/live">实时打分</a>
+        <a class="tab" id="tabCand" href="#/candidates">候选项<span class="badge hidden" id="candBadge">0</span></a>
+        <a class="tab" id="tabSettings" href="#/settings">设置</a>
+      </nav>
+      <button class="btn primary" id="btnNew">+ 新增条目</button>
+      <button class="btn" id="btnReload">刷新</button>
+    </div>
+  </header>
+
+  <div id="banner" class="banner hidden"></div>
+
+  <main>
+    <!-- ===== list view ===== -->
+    <section id="viewList" class="view">
+      <div class="listbar">
+        <input type="search" id="search" placeholder="搜索名称 / 标签 / 备注…" autocomplete="off" />
+        <select id="sort">
+          <option value="created_desc">最新添加</option>
+          <option value="created_asc">最早添加</option>
+          <option value="name">名称</option>
+          <option value="samples">样本数</option>
+        </select>
+        <span class="count" id="listCount"></span>
+      </div>
+      <div id="grid" class="grid"></div>
+      <div id="empty" class="empty hidden">
+        <p>还没有音效条目。</p>
+        <p>点右上角「+ 新增条目」，把 wav / mp3 拖进去即可。</p>
+      </div>
+    </section>
+
+    <!-- ===== create view ===== -->
+    <section id="viewCreate" class="view hidden">
+      <div class="panel">
+        <h2>新增音效条目</h2>
+        <form id="createForm" autocomplete="off">
+          <div class="grid2">
+            <div class="field">
+              <label>音频文件（wav / mp3，必填）</label>
+              <div id="audioDrop" class="drop">
+                <div class="dropHint">把音频文件拖到这里，或<u>点击选择</u></div>
+                <div class="dropFile" id="audioName">未选择文件</div>
+                <input type="file" id="audioInput" accept=".wav,.wave,.mp3,audio/wav,audio/mpeg" hidden />
+              </div>
+              <div class="hint">入库时统一转成 48000 Hz / 16-bit / 单声道，原始格式会记录在元数据里。</div>
+            </div>
+            <div class="field">
+              <label>图标（png / jpg，可选）</label>
+              <div id="iconDrop" class="drop small">
+                <img id="iconPreview" class="iconPreview hidden" alt="图标预览" />
+                <div id="iconHint" class="dropHint">拖入图片或<u>点击选择</u></div>
+                <input type="file" id="iconInput" accept=".png,.jpg,.jpeg,image/png,image/jpeg" hidden />
+              </div>
+              <div class="hint">自动裁剪并缩放到 128×128 PNG。不选则生成占位图。</div>
+            </div>
+          </div>
+
+          <div class="grid2">
+            <div class="field">
+              <label for="cName">名称（必填）</label>
+              <input type="text" id="cName" placeholder="例如：拾取物品" maxlength="80" />
+            </div>
+            <div class="field">
+              <label for="cTags">标签（逗号分隔）</label>
+              <input type="text" id="cTags" placeholder="例如：UI,拾取" />
+            </div>
+          </div>
+
+          <div class="grid3">
+            <div class="field">
+              <label for="cThreshold">阈值 threshold（0.5–1.0）</label>
+              <input type="number" id="cThreshold" value="0.72" min="0.5" max="1" step="0.01" />
+            </div>
+            <div class="field">
+              <label for="cCooldown">冷却 cooldownMs</label>
+              <input type="number" id="cCooldown" value="400" min="0" max="60000" step="10" />
+            </div>
+            <div class="field">
+              <label for="cProfile">配置档 profile</label>
+              <input type="text" id="cProfile" value="default" maxlength="40" />
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="cNote">备注</label>
+            <textarea id="cNote" rows="3" placeholder="例如：搜包完成时听到的那声"></textarea>
+          </div>
+
+          <div class="formActions">
+            <button type="submit" class="btn primary" id="btnCreate">提交</button>
+            <button type="button" class="btn" id="btnCreateCancel">取消</button>
+            <span class="status" id="createStatus"></span>
+          </div>
+        </form>
+      </div>
+    </section>
+
+    <!-- ===== detail view ===== -->
+    <section id="viewDetail" class="view hidden">
+      <div class="panel">
+        <div class="detailHead">
+          <img id="dIcon" class="bigIcon" alt="图标" />
+          <div class="detailMain">
+            <h2 id="dName">—</h2>
+            <div class="tags" id="dTags"></div>
+            <div class="hint" id="dIds"></div>
+          </div>
+          <div class="detailActions">
+            <button class="btn" id="btnBack">← 返回列表</button>
+            <button class="btn danger" id="btnDelete">删除条目</button>
+          </div>
+        </div>
+
+        <div class="grid2">
+          <div class="field">
+            <label for="dNameInput">名称</label>
+            <input type="text" id="dNameInput" maxlength="80" />
+          </div>
+          <div class="field">
+            <label for="dTagsInput">标签（逗号分隔）</label>
+            <input type="text" id="dTagsInput" />
+          </div>
+        </div>
+        <div class="grid3">
+          <div class="field">
+            <label for="dThreshold">阈值 threshold</label>
+            <input type="number" id="dThreshold" min="0.5" max="1" step="0.01" />
+          </div>
+          <div class="field">
+            <label for="dCooldown">冷却 cooldownMs</label>
+            <input type="number" id="dCooldown" min="0" max="60000" step="10" />
+          </div>
+          <div class="field">
+            <label for="dProfile">配置档 profile</label>
+            <input type="text" id="dProfile" maxlength="40" />
+          </div>
+        </div>
+        <div class="field">
+          <label for="dNote">备注</label>
+          <textarea id="dNote" rows="2"></textarea>
+        </div>
+        <div class="field">
+          <label>更换图标（png / jpg，可选）</label>
+          <input type="file" id="dIconInput" accept=".png,.jpg,.jpeg,image/png,image/jpeg" />
+        </div>
+        <div class="formActions">
+          <button class="btn primary" id="btnSave">保存修改</button>
+          <span class="status" id="detailStatus"></span>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>样本列表（<span id="dSampleCount">0</span>）</h2>
+        <table class="samples">
+          <thead>
+            <tr>
+              <th>#</th><th>文件</th><th>时长</th><th>原始格式</th><th>入库时间</th><th>试听</th><th></th>
+            </tr>
+          </thead>
+          <tbody id="sampleRows"></tbody>
+        </table>
+        <div class="formActions">
+          <input type="file" id="sampleInput" accept=".wav,.wave,.mp3,audio/wav,audio/mpeg" />
+          <button class="btn" id="btnAddSample">追加样本</button>
+          <span class="status" id="sampleStatus"></span>
+        </div>
+        <div class="hint">追加样本用于同一音效的变体（近 / 远 / 隔墙）。删除后样本会重新编号。</div>
+      </div>
+    </section>
+
+    <!-- ===== live scoring view ===== -->
+    <section id="viewLive" class="view hidden">
+      <div class="panel">
+        <h2>实时打分（听不出区别？看柱子）</h2>
+        <div class="livebar">
+          <div class="field inline">
+            <label for="liveDevice">采集端点（系统播放声音的那张声卡）</label>
+            <select id="liveDevice"></select>
+          </div>
+          <div class="field inline">
+            <label for="liveWav">或回放音频文件（离线，不用声卡）</label>
+            <input type="text" id="liveWav" placeholder="留空 = 用上面的端点采集" />
+          </div>
+          <div class="field inline small">
+            <label for="liveTickMs">刷新间隔 (ms)</label>
+            <input type="number" id="liveTickMs" value="50" min="20" max="500" step="10" />
+          </div>
+          <div class="field inline small">
+            <label for="liveTopN">显示前 N 名</label>
+            <input type="number" id="liveTopN" value="8" min="3" max="20" step="1" />
+          </div>
+          <div class="liveActions">
+            <button class="btn primary" id="btnLiveStart">开始</button>
+            <button class="btn" id="btnLiveStop" disabled>停止</button>
+          </div>
+        </div>
+        <div class="hint" id="liveSource">未运行。选好端点后点「开始」，然后在游戏里制造声音。</div>
+        <div class="hint" id="liveError"></div>
+      </div>
+
+      <div class="panel">
+        <div class="levelWrap">
+          <div class="levelHead">
+            <span>当前电平</span>
+            <span class="mono" id="levelText">— dBFS</span>
+          </div>
+          <div class="meter" id="levelMeter">
+            <div class="meterFill" id="levelFill"></div>
+            <div class="meterPeak" id="levelPeak"></div>
+            <div class="meterGate" id="levelGate" title="静音门限"></div>
+          </div>
+          <div class="levelScale"><span>-60</span><span>-40</span><span>-20</span><span>0 dBFS</span></div>
+        </div>
+        <div class="liveStats mono" id="liveStats">—</div>
+        <div class="liveStats mono" id="liveWarn"></div>
+      </div>
+
+      <div class="panel">
+        <h2>当前最像的音效（越绿越像）</h2>
+        <div id="topBars" class="bars">
+          <div class="empty">还没有分数。点上面的「开始」。</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>命中时间线（<span id="eventCount">0</span>）</h2>
+        <div class="hint">命中阈值会随条目设置生效；下面的滑块直接写回条目（PATCH /api/items/&lt;id&gt;）。</div>
+        <div class="livebar">
+          <div class="field inline">
+            <label for="thrItem">条目</label>
+            <select id="thrItem"></select>
+          </div>
+          <div class="field inline">
+            <label for="thrValue">阈值 <span class="mono" id="thrText">—</span></label>
+            <input type="range" id="thrValue" min="0.5" max="0.99" step="0.01" value="0.72" />
+          </div>
+          <div class="liveActions">
+            <button class="btn" id="btnThrApply">应用阈值</button>
+            <span class="status" id="thrStatus"></span>
+          </div>
+        </div>
+        <ul class="events" id="eventList"></ul>
+      </div>
+    </section>
+
+    <!-- ===== candidate inbox view (P4) ===== -->
+    <section id="viewCandidates" class="view hidden">
+      <div class="panel">
+        <h2>候选项收件箱（"刚才那几秒"）</h2>
+        <div class="livebar">
+          <button class="btn primary" id="btnRecallNow">立即保存最近 <span id="recallSeconds">3</span> 秒</button>
+          <div class="field inline">
+            <label>热键（只读）</label>
+            <span class="mono" id="recallHotkey">—</span>
+          </div>
+          <div class="field inline">
+            <label>环形缓冲</label>
+            <span class="mono" id="recallRing">—</span>
+          </div>
+          <div class="liveActions">
+            <button class="btn" id="btnRecallRefresh">刷新</button>
+            <span class="status" id="recallStatus"></span>
+          </div>
+        </div>
+        <div class="hint" id="recallNote">—</div>
+        <div class="mono stateLine" id="recallState">—</div>
+      </div>
+
+      <div id="candList" class="candList"></div>
+      <div id="candEmpty" class="empty hidden">
+        <p>收件箱是空的。</p>
+        <p>玩游戏时按一下热键（默认 <b>F8</b>），或点上面的「立即保存」按钮，就会把最近几秒存进来。</p>
+      </div>
+    </section>
+
+    <!-- ===== settings view ===== -->
+    <section id="viewSettings" class="view hidden">
+      <div class="panel">
+        <h2>采集端点</h2>
+        <div class="livebar">
+          <div class="field inline">
+            <label for="setDevice">采集端点（系统播放声音的那张声卡）</label>
+            <select id="setDevice"></select>
+          </div>
+          <div class="liveActions">
+            <button class="btn primary" id="btnSaveDevice">保存采集端点</button>
+            <span class="status" id="setDeviceStatus"></span>
+          </div>
+        </div>
+        <div class="hint">改端点会立刻生效：正在跑的实时打分会话会用新端点重新开始；没有会话在跑就只写进配置文件。</div>
+      </div>
+
+      <div class="panel">
+        <h2>悬浮窗位置与大小</h2>
+        <div class="grid3">
+          <div class="field">
+            <label for="setX">X（物理像素）</label>
+            <input type="number" id="setX" step="1" />
+          </div>
+          <div class="field">
+            <label for="setY">Y（物理像素）</label>
+            <input type="number" id="setY" step="1" />
+          </div>
+          <div class="field">
+            <label for="setMonitor">显示器（按锚点定位时生效）</label>
+            <select id="setMonitor"></select>
+          </div>
+        </div>
+
+        <div class="field">
+          <label>锚点（X、Y 都为 0 时生效）</label>
+          <div class="anchorGrid">
+            <button type="button" class="anchorBtn" id="anchorTopLeft" data-anchor="top-left">左上</button>
+            <button type="button" class="anchorBtn" id="anchorTopCenter" data-anchor="top-center">上中</button>
+            <button type="button" class="anchorBtn" id="anchorTopRight" data-anchor="top-right">右上</button>
+            <button type="button" class="anchorBtn" id="anchorMiddleLeft" data-anchor="middle-left">左中</button>
+            <button type="button" class="anchorBtn" id="anchorCenter" data-anchor="center">居中</button>
+            <button type="button" class="anchorBtn" id="anchorMiddleRight" data-anchor="middle-right">右中</button>
+            <button type="button" class="anchorBtn" id="anchorBottomLeft" data-anchor="bottom-left">左下</button>
+            <button type="button" class="anchorBtn" id="anchorBottomCenter" data-anchor="bottom-center">下中</button>
+            <button type="button" class="anchorBtn" id="anchorBottomRight" data-anchor="bottom-right">右下</button>
+          </div>
+        </div>
+
+        <div class="grid3">
+          <div class="field">
+            <label for="setMargin">锚点边距 margin（按显示器 DPI 缩放）</label>
+            <input type="number" id="setMargin" min="0" max="4096" step="1" />
+          </div>
+          <div class="field">
+            <label for="setSize">格子大小（物理像素）<span class="mono" id="setSizeText">—</span></label>
+            <input type="range" id="setSize" min="24" max="320" step="4" />
+          </div>
+          <div class="field">
+            <label for="setOpacity">不透明度<span class="mono" id="setOpacityText">—</span></label>
+            <input type="range" id="setOpacity" min="0.1" max="1" step="0.01" />
+          </div>
+        </div>
+
+        <div class="hint">X / Y 是「物理像素」（多显示器时可以是负数）。只要 X 或 Y 有一个不是 0，就按绝对坐标摆放；把 X、Y 都设为 0，锚点、显示器和边距才会生效。</div>
+
+        <div class="formActions">
+          <button class="btn primary" id="btnApplyOverlay">保存并立即生效</button>
+          <button class="btn" id="btnPreview">预览</button>
+          <div class="field inline">
+            <label for="setPreviewItem">预览条目</label>
+            <select id="setPreviewItem"></select>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>显示行为</h2>
+        <div class="grid3">
+          <div class="field">
+            <label for="setDuration">保持时长 durationMs</label>
+            <input type="number" id="setDuration" min="0" max="60000" step="50" />
+          </div>
+          <div class="field">
+            <label for="setFadeIn">淡入 fadeInMs</label>
+            <input type="number" id="setFadeIn" min="0" max="10000" step="10" />
+          </div>
+          <div class="field">
+            <label for="setFadeOut">淡出 fadeOutMs</label>
+            <input type="number" id="setFadeOut" min="0" max="10000" step="10" />
+          </div>
+        </div>
+        <div class="grid2">
+          <div class="field">
+            <label for="setMaxSim">最多同时显示个数</label>
+            <input type="number" id="setMaxSim" min="1" max="12" step="1" />
+          </div>
+          <div class="field">
+            <label>显示内容</label>
+            <label class="check"><input type="checkbox" id="setShowName" /> 显示名称</label>
+            <label class="check"><input type="checkbox" id="setShowScore" /> 显示分数</label>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>显示 / 隐藏 · 热键 · 状态</h2>
+        <div class="livebar">
+          <button class="btn" id="btnToggleOverlay">隐藏悬浮窗</button>
+          <div class="field inline">
+            <label>切换热键（只读）</label>
+            <span class="mono" id="setHotkey">—</span>
+          </div>
+          <div class="liveActions">
+            <span class="status" id="setStatus"></span>
+          </div>
+        </div>
+        <div class="hint" id="setOverlayNote"></div>
+        <div class="mono stateLine" id="setOverlayState">—</div>
+        <div class="mono" id="setConfigPath">—</div>
+      </div>
+
+      <div class="panel">
+        <h2>热键编辑</h2>
+        <div class="livebar">
+          <div class="field inline">
+            <label for="setHotkeyInput">切换悬浮窗热键</label>
+            <input type="text" id="setHotkeyInput" maxlength="40" placeholder="例如 F9 或 Ctrl+Alt+F9" />
+          </div>
+          <div class="liveActions">
+            <button class="btn primary" id="btnSaveHotkey">保存热键</button>
+            <span class="status" id="setHotkeyStatus"></span>
+          </div>
+        </div>
+        <div class="hint">接受的写法：F1..F24、A..Z、0..9，可选 Ctrl+ / Alt+ / Shift+ / Win+ 前缀（例如 Ctrl+Alt+F9），或者填 none 表示不注册热键。</div>
+      </div>
+
+      <div class="panel">
+        <h2>回溯保存（P4：刚才那 3 秒）</h2>
+        <div class="livebar">
+          <div class="field inline">
+            <label for="setRecallHotkey">回溯保存热键</label>
+            <input type="text" id="setRecallHotkey" maxlength="40" placeholder="例如 F8 或 Ctrl+Alt+F8" />
+          </div>
+          <div class="field inline small">
+            <label for="setRecallSeconds">保存时长（秒，1–30）</label>
+            <input type="number" id="setRecallSeconds" min="1" max="30" step="1" />
+          </div>
+          <div class="field inline small">
+            <label for="setRecallMax">最多保留（1–5000）</label>
+            <input type="number" id="setRecallMax" min="1" max="5000" step="1" />
+          </div>
+          <div class="liveActions">
+            <button class="btn primary" id="btnSaveRecall">保存回溯设置</button>
+            <span class="status" id="setRecallStatus"></span>
+          </div>
+        </div>
+        <div class="grid2">
+          <div class="field">
+            <label for="setRecallDir">候选项目录（相对路径按 exe 目录解析）</label>
+            <input type="text" id="setRecallDir" maxlength="200" />
+          </div>
+          <div class="field">
+            <label class="check"><input type="checkbox" id="setRecallEnabled" /> 启用回溯保存</label>
+            <div class="hint">关掉后 `overlay` / `serve` / `live` 都不会注册回溯热键（`soundradar recall` 仍然能手动跑一次）。</div>
+          </div>
+        </div>
+        <div class="hint" id="setRecallState">—</div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <span>库格式：<code>library.srz</code>（ZIP，含 manifest.json / items/&lt;id&gt;/meta.json / icon.png / samples/NNNN.wav）</span>
+    <span id="featureInfo" class="mono"></span>
+  </footer>
+
+  <script src="/app.js"></script>
+</body>
+</html>
