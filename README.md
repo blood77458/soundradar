@@ -61,13 +61,3 @@ cd soundradar
 | `soundradar match --wav 录音.wav` | 离线看这段录音最像库里的哪一条 |
 | `soundradar index rebuild` | 手动重建指纹索引 |
 | `soundradar version` | 看版本 |
-
-## 这个仓库里没有的东西
-
-下面这些是本机用的，没有放进仓库，也没有放进 Release：
-
-- F8 还没入库的候选项
-- `config.json`：这台电脑的播放设备和悬浮窗位置
-- `bin\` 里的 exe：只在 Release 里提供
-- `.gocache`、`.gopath`：编译缓存，`build.ps1` 会重新拉
-- `spike\`、`artifacts\`：试验代码和验收过程文件
