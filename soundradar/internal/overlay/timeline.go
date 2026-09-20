@@ -65,6 +65,7 @@ func maxInt(a, b int) int {
 type entry struct {
 	ID    string
 	Name  string
+	Grid  string
 	Score float64
 	Icon  image.Image
 	Start time.Time
@@ -159,7 +160,7 @@ func (q *Queue) Show(it DisplayItem) int64 {
 				continue
 			}
 			e := q.items[i]
-			e.Name, e.Score, e.Icon = it.Name, it.Score, it.Icon
+			e.Name, e.Score, e.Icon, e.Grid = it.Name, it.Score, it.Icon, it.Grid
 			e.Start = now
 			q.items = append(q.items[:i], q.items[i+1:]...)
 			q.items = append(q.items, e)
@@ -173,9 +174,30 @@ func (q *Queue) Show(it DisplayItem) int64 {
 		q.dropped += int64(drop)
 	}
 	q.items = append(q.items, entry{
-		ID: it.ID, Name: it.Name, Score: it.Score, Icon: it.Icon, Start: now,
+		ID: it.ID, Name: it.Name, Grid: it.Grid, Score: it.Score, Icon: it.Icon, Start: now,
 	})
 	return q.seq
+}
+
+// Replace swaps the whole queue for items that share one start time. Used by
+// the expanded hint-card overlay so one hit becomes many tiles at once.
+func (q *Queue) Replace(items []DisplayItem) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	now := time.Now()
+	q.items = q.items[:0]
+	if len(items) == 0 {
+		return
+	}
+	if len(items) > q.max {
+		q.max = len(items)
+	}
+	for _, it := range items {
+		q.seq++
+		q.items = append(q.items, entry{
+			ID: it.ID, Name: it.Name, Grid: it.Grid, Score: it.Score, Icon: it.Icon, Start: now,
+		})
+	}
 }
 
 // Len returns the number of queued events.
@@ -219,7 +241,7 @@ func (q *Queue) Snapshot(now time.Time) []DisplayItem {
 		}
 		kept = append(kept, e)
 		out = append(out, DisplayItem{
-			ID: e.ID, Name: e.Name, Score: e.Score, Icon: e.Icon, AgeMs: age,
+			ID: e.ID, Name: e.Name, Grid: e.Grid, Score: e.Score, Icon: e.Icon, AgeMs: age,
 		})
 	}
 	q.items = kept

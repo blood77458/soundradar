@@ -316,11 +316,12 @@ type promoteRequest struct {
 	Note string   `json:"note"`
 	// Icon is either an existing item id to borrow the PNG from, or ignored when
 	// a file was uploaded in the same multipart request.
-	Icon         string   `json:"icon"`
-	TargetItemID string   `json:"targetItemId"`
-	Threshold    *float64 `json:"threshold"`
-	CooldownMs   *int     `json:"cooldownMs"`
-	Profile      string   `json:"profile"`
+	Icon         string                `json:"icon"`
+	TargetItemID string                `json:"targetItemId"`
+	Threshold    *float64              `json:"threshold"`
+	CooldownMs   *int                  `json:"cooldownMs"`
+	Profile      string                `json:"profile"`
+	DisplayHints []library.DisplayHint `json:"displayHints"`
 }
 
 // promoteResponse is the body of a successful promote.
@@ -382,13 +383,14 @@ func (s *Server) handlePromote(w http.ResponseWriter, r *http.Request, sink Reca
 			name = defaultCandidateName(cand)
 		}
 		it := &library.Item{
-			Name:       name,
-			Threshold:  clampFloat(derefFloat(req.Threshold, 0.72), 0, 1),
-			CooldownMs: int(clampFloat(float64(derefInt(req.CooldownMs, 400)), 0, 600000)),
-			Profile:    orDefaultString(strings.TrimSpace(req.Profile), "default"),
-			Tags:       normalizeTags(req.Tags),
-			Note:       strings.TrimSpace(req.Note),
-			Samples:    []library.Sample{newRecallSample(conv, cand)},
+			Name:         name,
+			Threshold:    clampFloat(derefFloat(req.Threshold, 0.72), 0, 1),
+			CooldownMs:   int(clampFloat(float64(derefInt(req.CooldownMs, 400)), 0, 600000)),
+			Profile:      orDefaultString(strings.TrimSpace(req.Profile), "default"),
+			Tags:         normalizeTags(req.Tags),
+			Note:         strings.TrimSpace(req.Note),
+			DisplayHints: req.DisplayHints,
+			Samples:      []library.Sample{newRecallSample(conv, cand)},
 		}
 		if err := s.store.AddItem(it, iconPNG, [][]byte{conv.WAV}); err != nil {
 			writeStoreError(w, err)
@@ -506,6 +508,9 @@ func readPromoteBody(r *http.Request, s *Server) (promoteRequest, []byte, error)
 			if v := r.FormValue("cooldownMs"); v != "" {
 				n := int(parseFloatDefault(v, 400))
 				req.CooldownMs = &n
+			}
+			if v := strings.TrimSpace(r.FormValue("displayHints")); v != "" {
+				req.DisplayHints = parseDisplayHintsForm(v)
 			}
 		}
 		// "icon" is a FILE when the browser sends one and a plain form value

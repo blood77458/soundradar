@@ -9,6 +9,9 @@ import (
 	"time"
 
 	"github.com/znz/soundradar/internal/config"
+	"github.com/znz/soundradar/internal/dsp"
+	"github.com/znz/soundradar/internal/index"
+	"github.com/znz/soundradar/internal/library"
 	"github.com/znz/soundradar/internal/match"
 )
 
@@ -53,6 +56,7 @@ type patchConfigDTO struct {
 	Overlay *overlayPatch `json:"overlay"`
 	Hotkeys *hotkeyPatch  `json:"hotkeys"`
 	Recall  *recallPatch  `json:"recall"`
+	Noise   *noisePatch   `json:"noise"`
 	Profile *string       `json:"profile"`
 }
 
@@ -69,6 +73,17 @@ type recallPatch struct {
 	MaxFiles *int    `json:"maxFiles"`
 }
 
+// noisePatch is the environment-noise section of a PATCH /api/config body.
+type noisePatch struct {
+	Method        *string  `json:"method"`
+	HighPassHz    *float64 `json:"highPassHz"`
+	Strength      *float64 `json:"strength"`
+	GainFloorDB   *float64 `json:"gainFloorDb"`
+	AdaptiveGate  *bool    `json:"adaptiveGate"`
+	GateMarginDB  *float64 `json:"gateMarginDb"`
+	GateFloorDBFS *float64 `json:"gateFloorDbfs"`
+}
+
 type overlayPatch struct {
 	Enabled         *bool    `json:"enabled"`
 	Monitor         *int     `json:"monitor"`
@@ -83,6 +98,7 @@ type overlayPatch struct {
 	MaxSimultaneous *int     `json:"maxSimultaneous"`
 	ShowName        *bool    `json:"showName"`
 	ShowScore       *bool    `json:"showScore"`
+	ShowAll         *bool    `json:"showAll"`
 	Margin          *int     `json:"margin"`
 }
 
@@ -157,6 +173,7 @@ func (s *Server) patchConfig(w http.ResponseWriter, r *http.Request) {
 	next := s.currentConfig()
 	before := next
 	applyConfigPatch(&next, patch)
+	next.Normalize()
 	if err := next.Validate(); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -179,6 +196,14 @@ func (s *Server) patchConfig(w http.ResponseWriter, r *http.Request) {
 
 	// --- hot effects -----------------------------------------------------
 	effects := []string{}
+	if patch.Noise != nil {
+		s.setParams(paramsFromNoiseConfig(next.Noise))
+		if msg := s.rebuildIndexForParams(); msg != "" {
+			effects = append(effects, msg)
+		} else {
+			effects = append(effects, "环境音设置已保存")
+		}
+	}
 	if s.overlay != nil {
 		if err := s.overlay.ApplyConfig(next.Overlay); err != nil {
 			effects = append(effects, "悬浮窗: "+err.Error())
@@ -253,6 +278,29 @@ func applyConfigPatch(cfg *config.Config, p patchConfigDTO) {
 			cfg.Recall.MaxFiles = *rc.MaxFiles
 		}
 	}
+	if n := p.Noise; n != nil {
+		if n.Method != nil {
+			cfg.Noise.Method = strings.TrimSpace(*n.Method)
+		}
+		if n.HighPassHz != nil {
+			cfg.Noise.HighPassHz = *n.HighPassHz
+		}
+		if n.Strength != nil {
+			cfg.Noise.Strength = *n.Strength
+		}
+		if n.GainFloorDB != nil {
+			cfg.Noise.GainFloorDB = *n.GainFloorDB
+		}
+		if n.AdaptiveGate != nil {
+			cfg.Noise.AdaptiveGate = *n.AdaptiveGate
+		}
+		if n.GateMarginDB != nil {
+			cfg.Noise.GateMarginDB = *n.GateMarginDB
+		}
+		if n.GateFloorDBFS != nil {
+			cfg.Noise.GateFloorDBFS = *n.GateFloorDBFS
+		}
+	}
 
 	o := p.Overlay
 	if o == nil {
@@ -285,6 +333,7 @@ func applyConfigPatch(cfg *config.Config, p patchConfigDTO) {
 	set(&cfg.Overlay.MaxSimultaneous, o.MaxSimultaneous)
 	setBool(&cfg.Overlay.ShowName, o.ShowName)
 	setBool(&cfg.Overlay.ShowScore, o.ShowScore)
+	setBool(&cfg.Overlay.ShowAll, o.ShowAll)
 	set(&cfg.Overlay.Margin, o.Margin)
 }
 
@@ -395,7 +444,7 @@ func (s *Server) handleOverlayPreview(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else if it := s.store.Get(id); it != nil {
-		name = it.Name
+		name = library.FormatHitLabel(it.Name, it.DisplayHints, overlayHitMaxRunes)
 	} else {
 		writeError(w, http.StatusNotFound, "条目不存在: "+id)
 		return
@@ -408,7 +457,15 @@ func (s *Server) handleOverlayPreview(w http.ResponseWriter, r *http.Request) {
 		name = "预览音效"
 	}
 	const previewScore = 0.93
-	s.overlay.ShowHit(id, name, previewScore)
+	it := s.store.Get(id)
+	var hints []library.DisplayHint
+	if it != nil {
+		hints = it.DisplayHints
+		if name == "" {
+			name = it.Name
+		}
+	}
+	s.showOverlayHit(id, name, previewScore, hints)
 	s.logger.Printf("[api] POST /api/overlay/preview id=%s name=%q", id, name)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "id": id, "name": name, "score": previewScore,
@@ -445,6 +502,51 @@ func (s *Server) retargetCapture(device string) error {
 		return fmt.Errorf("用新端点重新开始失败: %w", err)
 	}
 	return nil
+}
+
+// paramsFromNoiseConfig mirrors cmd/soundradar.dspParamsFor so the management
+// API and the CLI agree on the fingerprint.
+func paramsFromNoiseConfig(n config.NoiseConfig) dsp.Params {
+	pipe := n.Pipeline()
+	out := dsp.DefaultNoiseParams()
+	out.Method = pipe.Method
+	out.HighPassHz = pipe.HighPassHz
+	out.OverSubtract = pipe.Strength
+	out.GainFloorDB = pipe.GainFloorDB
+	out.AdaptiveGate = pipe.AdaptiveGate
+	out.GateMarginDB = pipe.GateMarginDB
+	out.GateFloorDBFS = pipe.GateFloorDBFS
+	return dsp.DefaultParams().WithNoise(out)
+}
+
+func (s *Server) setParams(p dsp.Params) {
+	if err := p.Validate(); err != nil {
+		s.logger.Printf("[api] 忽略无效噪声参数: %v", err)
+		return
+	}
+	s.params = p
+}
+
+// rebuildIndexForParams rebuilds index.bin when the fingerprint changed.
+// Returns a short status string for the UI effects list (empty when nothing
+// needed rebuilding).
+func (s *Server) rebuildIndexForParams() string {
+	if s.store == nil {
+		return "环境音设置已保存（当前没有打开的音效库）"
+	}
+	libPath := s.store.Path()
+	idxPath := index.DefaultPathFor(libPath)
+	_, rebuilt, why, err := index.LoadOrBuild(libPath, idxPath, s.params)
+	if err != nil {
+		return "环境音已保存，但索引重建失败: " + err.Error()
+	}
+	if !rebuilt {
+		return ""
+	}
+	if why == "" {
+		why = "噪声参数变更"
+	}
+	return "索引已按新环境音参数重建（" + why + "）"
 }
 
 var _ = sync.Mutex{}

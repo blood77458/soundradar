@@ -35,6 +35,9 @@ func OpenStream(deviceSubstr string) (*Stream, error) {
 
 	go func() {
 		defer close(done)
+		// Close the block channel on every exit path. Otherwise a failed or
+		// finished capture leaves Read blocked forever, and Stop never returns.
+		defer close(ch)
 		// newLoopbackCapturer locks THIS goroutine to its OS thread and
 		// initialises COM in MTA, so every call below stays in the same
 		// apartment.

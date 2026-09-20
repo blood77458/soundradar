@@ -143,7 +143,7 @@ func runLive(args []string) error {
 	if err != nil {
 		return fmt.Errorf("索引路径无效: %w", err)
 	}
-	params := dsp.DefaultParams()
+	params := dspParamsFor(loadNoiseConfig(""))
 	ix, rebuilt, why, err := index.LoadOrBuild(lib, idx, params)
 	if err != nil {
 		return fmt.Errorf("准备索引失败: %w", err)

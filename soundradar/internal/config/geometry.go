@@ -240,6 +240,32 @@ func ResolvePosition(o OverlayConfig, monitors []MonitorInfo) (x, y, w, h int, e
 	return x, y, w, h, nil
 }
 
+// ResolvePositionSized is ResolvePosition with an explicit canvas size, so the
+// expanded hint-card overlay can grow past MaxSimultaneous without moving the
+// anchor math.
+func ResolvePositionSized(o OverlayConfig, monitors []MonitorInfo, w, h int) (x, y int, err error) {
+	if w <= 0 || h <= 0 {
+		w, h = CanvasSize(o)
+	}
+	if o.X != 0 || o.Y != 0 {
+		return o.X, o.Y, nil
+	}
+	if len(monitors) == 0 {
+		return 0, 0, errors.New("没有可用的显示器信息，无法按锚点定位")
+	}
+	m, _ := MonitorByIndex(monitors, o.Monitor)
+	scale := m.Scale
+	if scale <= 0 {
+		scale = float64(m.DPI) / dpiBase
+	}
+	if scale <= 0 {
+		scale = 1
+	}
+	margin := int(float64(o.Margin)*scale + 0.5)
+	wx, wy, ww, wh := m.WorkRect()
+	return AnchorPosition(o.Anchor, wx, wy, ww, wh, w, h, margin)
+}
+
 // ResolveMonitor returns the monitor the overlay should live on: the one that
 // contains the resolved position, or the configured index when that fails.
 func ResolveMonitor(o OverlayConfig, monitors []MonitorInfo) (MonitorInfo, bool) {

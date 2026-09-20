@@ -292,7 +292,13 @@ type Engine struct {
 // Run; they must not block (they are UI/CLI sinks).
 func New(src FrameSource, idx *index.Index, opts Options, onTick func(Tick), onEvent func(match.Event)) (*Engine, error) {
 	opts = opts.withDefaults()
+	// Always analyse with the same parameters the index was built with. Hard-
+	// coding DefaultParams here used to break live start after the user tuned
+	// config.json's noise section (index fingerprint ≠ default fingerprint).
 	p := dsp.DefaultParams()
+	if idx != nil {
+		p = idx.Params()
+	}
 	if err := p.Validate(); err != nil {
 		return nil, fmt.Errorf("特征参数无效: %w", err)
 	}

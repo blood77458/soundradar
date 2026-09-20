@@ -82,6 +82,9 @@ type liveHub struct {
 	eng       *live.Engine
 	cancel    context.CancelFunc
 	done      chan struct{}
+	// gen identifies the running session. A forced stop bumps it so a late
+	// engine exit cannot clear a session that was started afterwards.
+	gen       uint64
 	running   bool
 	cfg       LiveConfig
 	srcInfo   live.SourceInfo
@@ -154,14 +157,21 @@ type HitDTO struct {
 
 // EventDTO is one recognised sound effect.
 type EventDTO struct {
-	Time      time.Time `json:"t"`
-	AudioMs   float64   `json:"audioMs"`
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Score     float64   `json:"score"`
-	Margin    *float64  `json:"margin"`
-	LevelDBFS *float64  `json:"level"`
+	Time         time.Time        `json:"t"`
+	AudioMs      float64          `json:"audioMs"`
+	ID           string           `json:"id"`
+	Name         string           `json:"name"` // display label (class + grid hints)
+	ClassName    string           `json:"className,omitempty"`
+	Hint         string           `json:"hint,omitempty"` // same as Name when hints present
+	DisplayHints []DisplayHintDTO `json:"displayHints,omitempty"`
+	IconURL      string           `json:"iconUrl,omitempty"`
+	Score        float64          `json:"score"`
+	Margin       *float64         `json:"margin"`
+	LevelDBFS    *float64         `json:"level"`
 }
+
+// overlayHitMaxRunes keeps the floating hit popup readable on a small card.
+const overlayHitMaxRunes = 72
 
 // TickDTO is the SSE "tick" payload (also embedded in GET /api/live).
 type TickDTO struct {
@@ -598,6 +608,8 @@ func (h *liveHub) start(cfg LiveConfig) error {
 	done := make(chan struct{})
 
 	h.mu.Lock()
+	h.gen++
+	gen := h.gen
 	h.eng = eng
 	h.cancel = cancel
 	h.done = done
@@ -610,24 +622,38 @@ func (h *liveHub) start(cfg LiveConfig) error {
 	h.mu.Unlock()
 
 	go func() {
-		defer close(done)
-		defer func() {
-			if hook := h.srv.onLiveFn(); hook != nil {
-				hook(false)
-			}
-		}()
 		err := eng.Run(ctx)
 		h.mu.Lock()
-		h.running = false
-		h.stats = eng.Stats()
-		h.eng = nil
-		h.cancel = nil
-		if err != nil {
-			h.lastErr = err.Error()
+		stale := h.gen != gen
+		if !stale {
+			h.running = false
+			h.stats = eng.Stats()
+			h.eng = nil
+			h.cancel = nil
+			if err != nil {
+				h.lastErr = err.Error()
+			}
 		}
 		h.mu.Unlock()
-		h.publish("state", map[string]any{"running": false, "error": errString(err)})
-		h.srv.logger.Printf("[live] 会话结束: %v", err)
+		if !stale {
+			h.publish("state", map[string]any{"running": false, "error": errString(err)})
+			h.srv.logger.Printf("[live] 会话结束: %v", err)
+		}
+		// Unblock POST /api/live/stop before resuming the recall fallback capture.
+		// Opening WASAPI again can take seconds (or hang briefly); it must not
+		// sit on the stop critical path.
+		close(done)
+		if hook := h.srv.onLiveFn(); hook != nil {
+			resume := !stale
+			if stale {
+				h.mu.Lock()
+				resume = !h.running
+				h.mu.Unlock()
+			}
+			if resume {
+				hook(false)
+			}
+		}
 	}()
 
 	h.srv.logger.Printf("[live] 开始: 源=%s 库=%s 索引=%s", eng.SourceInfo().Detail, libPath, idxPath)
@@ -650,9 +676,11 @@ func (h *liveHub) fail(err error) {
 }
 
 // stop cancels the engine and waits for it (and the source) to unwind.
+// A stuck capture must not fail the button: after a few seconds the session
+// is marked stopped so the panel can start again.
 func (h *liveHub) stop() (LiveStateDTO, error) {
 	h.mu.Lock()
-	cancel, done, eng := h.cancel, h.done, h.eng
+	cancel, done, eng, gen := h.cancel, h.done, h.eng, h.gen
 	h.mu.Unlock()
 	if cancel == nil {
 		return h.state(), nil
@@ -660,14 +688,28 @@ func (h *liveHub) stop() (LiveStateDTO, error) {
 	cancel()
 	select {
 	case <-done:
-	case <-time.After(10 * time.Second):
-		return h.state(), errors.New("停止实时识别超时（10 s）")
+	case <-time.After(4 * time.Second):
+		h.mu.Lock()
+		if h.gen == gen {
+			h.gen++
+			h.running = false
+			h.cancel = nil
+			h.done = nil
+			h.eng = nil
+			h.lastErr = ""
+		}
+		h.mu.Unlock()
+		if h.srv != nil && h.srv.logger != nil {
+			h.srv.logger.Printf("[live] 停止超时，已强制结束会话")
+		}
 	}
 	h.mu.Lock()
-	if eng != nil {
+	if eng != nil && h.gen == gen {
 		h.stats = eng.Stats()
 	}
-	h.running = false
+	if h.gen == gen {
+		h.running = false
+	}
 	h.mu.Unlock()
 	return h.state(), nil
 }
@@ -764,10 +806,10 @@ func (h *liveHub) onEvent(ev match.Event) {
 	// P3: pop the hit overlay. The call only enqueues an item and posts a window
 	// message, so it cannot stall the recognition path.
 	if sink != nil {
-		sink.ShowHit(ev.ID, ev.Name, ev.Score)
+		h.showOnOverlay(sink, ev, dto)
 	}
 	h.srv.logger.Printf("[live] 命中 %s（%s）分数 %.4f margin %.4f 电平 %s dBFS",
-		ev.Name, ev.ID, ev.Score, ev.Margin, formatDBFS(ev.LevelDBFS))
+		dto.Name, ev.ID, ev.Score, ev.Margin, formatDBFS(ev.LevelDBFS))
 	h.send(subs, sseMessage{event: "event", data: dto})
 }
 
@@ -783,7 +825,7 @@ func (h *liveHub) tickToDTO(tk live.Tick) TickDTO {
 	for _, s := range tk.Top {
 		dto.Top = append(dto.Top, HitDTO{
 			ID:            s.ID,
-			Name:          s.Name,
+			Name:          h.formatHitName(s.ID, s.Name, 0),
 			Score:         s.Score.Float(),
 			TemplateIndex: s.Score.TemplateIndex(),
 		})
@@ -803,15 +845,90 @@ func (h *liveHub) eventToDTO(ev match.Event) EventDTO {
 	if !started.IsZero() {
 		audioMs = float64(ev.Time.Sub(started).Microseconds()) / 1000
 	}
-	return EventDTO{
-		Time:      ev.Time,
-		AudioMs:   audioMs,
-		ID:        ev.ID,
-		Name:      ev.Name,
-		Score:     ev.Score,
-		Margin:    finitePtr(ev.Margin),
-		LevelDBFS: finitePtr(ev.LevelDBFS),
+	className := ev.Name
+	hints := h.hintsFor(ev.ID)
+	label := library.FormatHitLabel(className, hints, 0)
+	hintDTOs := make([]DisplayHintDTO, 0, len(hints))
+	var it *library.Item
+	if h.srv != nil && h.srv.store != nil {
+		it = h.srv.store.Get(ev.ID)
 	}
+	for i, hh := range hints {
+		row := DisplayHintDTO{Grid: hh.Grid, Name: hh.Name}
+		if it != nil && len(it.HintIcon(i)) > 0 {
+			row.IconURL = fmt.Sprintf("/api/items/%s/hints/%d/icon.png?v=%d", ev.ID, i, it.UpdatedAt.Unix())
+		}
+		hintDTOs = append(hintDTOs, row)
+	}
+	dto := EventDTO{
+		Time:         ev.Time,
+		AudioMs:      audioMs,
+		ID:           ev.ID,
+		Name:         label,
+		ClassName:    className,
+		DisplayHints: hintDTOs,
+		IconURL:      "/api/items/" + ev.ID + "/icon.png",
+		Score:        ev.Score,
+		Margin:       finitePtr(ev.Margin),
+		LevelDBFS:    finitePtr(ev.LevelDBFS),
+	}
+	if len(hints) > 0 {
+		dto.Hint = label
+	}
+	return dto
+}
+
+// hintsFor returns displayHints for an indexed item (empty if unknown / none).
+func (h *liveHub) hintsFor(id string) []library.DisplayHint {
+	if h == nil || h.srv == nil || h.srv.store == nil {
+		return nil
+	}
+	it := h.srv.store.Get(id)
+	if it == nil || len(it.DisplayHints) == 0 {
+		return nil
+	}
+	return append([]library.DisplayHint{}, it.DisplayHints...)
+}
+
+func (h *liveHub) formatHitName(id, className string, maxRunes int) string {
+	return library.FormatHitLabel(className, h.hintsFor(id), maxRunes)
+}
+
+func (h *liveHub) showOnOverlay(sink OverlayBridge, ev match.Event, dto EventDTO) {
+	if sink == nil || h == nil || h.srv == nil {
+		return
+	}
+	h.srv.showOverlayHit(ev.ID, dto.Name, ev.Score, h.hintsFor(ev.ID))
+}
+
+// showOverlayHit pops the floating window. showAll expands every grid hint
+// into its own card; otherwise the compact one-line hit is unchanged.
+func (s *Server) showOverlayHit(id, label string, score float64, hints []library.DisplayHint) {
+	if s == nil || s.overlay == nil {
+		return
+	}
+	if !s.currentConfig().Overlay.ShowAll || len(hints) == 0 {
+		if label == "" {
+			label = id
+		}
+		s.overlay.ShowHit(id, label, score)
+		return
+	}
+	it := s.store.Get(id)
+	cards := make([]OverlayCard, 0, len(hints))
+	for i, h := range hints {
+		card := OverlayCard{
+			Grid: strings.ReplaceAll(strings.ToLower(h.Grid), "x", "×"),
+			Name: h.Name,
+		}
+		if it != nil {
+			if png := it.HintIcon(i); len(png) > 0 {
+				card.PNG = append([]byte(nil), png...)
+			}
+		}
+		cards = append(cards, card)
+	}
+	s.overlay.ShowCards(id, score, cards)
 }
 
 func statsToDTO(st live.Stats, running bool) StatsDTO {

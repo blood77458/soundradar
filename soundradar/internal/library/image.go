@@ -78,6 +78,56 @@ func encodeIcon128(src image.Image) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// ScaleIconFit is like ScaleIcon but letterboxes the whole picture into the
+// 128×128 canvas (transparent bars) instead of centre-cropping. Hint icons use
+// this so the image matches the file the user uploaded.
+func ScaleIconFit(raw []byte) ([]byte, error) {
+	if len(raw) == 0 {
+		return nil, errors.New("图标内容为空")
+	}
+	img, format, err := image.Decode(bytes.NewReader(raw))
+	if err != nil {
+		if m, werr := webp.Decode(bytes.NewReader(raw)); werr == nil {
+			img, format = m, "webp"
+		} else {
+			return nil, fmt.Errorf("无法解析图标文件（仅支持 PNG / JPEG）: %w", err)
+		}
+	}
+	if !iconFormats[format] {
+		return nil, fmt.Errorf("%w: %s（仅支持 PNG / JPEG）", ErrIconFormat, format)
+	}
+	return encodeIconFit(img)
+}
+
+func encodeIconFit(src image.Image) ([]byte, error) {
+	b := src.Bounds()
+	w, h := b.Dx(), b.Dy()
+	if w <= 0 || h <= 0 {
+		return nil, errors.New("图标尺寸无效")
+	}
+	dst := image.NewNRGBA(image.Rect(0, 0, IconSize, IconSize))
+	scale := float64(IconSize) / float64(w)
+	if float64(IconSize)/float64(h) < scale {
+		scale = float64(IconSize) / float64(h)
+	}
+	dw := int(float64(w)*scale + 0.5)
+	dh := int(float64(h)*scale + 0.5)
+	if dw < 1 {
+		dw = 1
+	}
+	if dh < 1 {
+		dh = 1
+	}
+	ox := (IconSize - dw) / 2
+	oy := (IconSize - dh) / 2
+	draw.CatmullRom.Scale(dst, image.Rect(ox, oy, ox+dw, oy+dh), src, b, draw.Over, nil)
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, dst); err != nil {
+		return nil, fmt.Errorf("编码 icon.png: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
 // centerSquare crops img to the largest centred square.
 func centerSquare(img *image.NRGBA) *image.NRGBA {
 	b := img.Bounds()

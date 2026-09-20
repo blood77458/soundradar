@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/znz/soundradar/internal/capture"
 )
@@ -73,20 +74,39 @@ func (s *captureSource) Start() error {
 func (s *captureSource) Frames() <-chan []float32 { return s.ch }
 
 // Stop closes the WASAPI stream and waits for the pump goroutine.
+//
+// Close runs before the wait: the pump only notices quit between Read calls,
+// and Read stays blocked until the stream signals quit or closes its channel.
+// Waiting for Close itself is bounded so a stuck COM call cannot pin the
+// recognition goroutine (and therefore POST /api/live/stop) forever.
 func (s *captureSource) Stop() error {
 	s.mu.Lock()
 	started := s.started
 	s.mu.Unlock()
-	if !started {
-		s.stopOnce.Do(func() {
-			close(s.quit)
+	s.stopOnce.Do(func() {
+		close(s.quit)
+		if !started {
 			close(s.ch)
-		})
-		_ = s.st.Close()
+		}
+	})
+	if s.st != nil {
+		closed := make(chan struct{})
+		go func() {
+			_ = s.st.Close()
+			close(closed)
+		}()
+		select {
+		case <-closed:
+		case <-time.After(2 * time.Second):
+		}
+	}
+	if !started {
 		return nil
 	}
-	s.stopOnce.Do(func() { close(s.quit) })
-	<-s.done
+	select {
+	case <-s.done:
+	case <-time.After(2 * time.Second):
+	}
 	return nil
 }
 

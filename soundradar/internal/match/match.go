@@ -25,6 +25,16 @@
 // events, and the second Tick inside the refractory window is suppressed
 // entirely. That is the "BGM paragraph must not flood the log" requirement.
 //
+// # Peak hold
+//
+// A short sound's similarity score rises and falls across hops as the analysis
+// window slides over the transient. Firing on the first hop past the threshold
+// therefore reports a phase-dependent score: the same clip replayed a few
+// milliseconds later can look 0.05–0.15 worse. PeakHoldMs waits after the first
+// cross and reports the highest score seen in that window (or flushes early when
+// the score drops / the window goes silent), so repeated plays of the same
+// audio land on a stable peak.
+//
 // The engine never suppresses silently in the sense of losing information: it
 // keeps the rejected candidate as Pending, and PendingScore/PendingID expose it
 // for diagnostics.
@@ -61,6 +71,10 @@ type Options struct {
 	// RefractoryMs is the global "no event at all" window: two different items
 	// cannot both fire inside it.
 	RefractoryMs int
+	// PeakHoldMs is how long after the first threshold-cross the engine waits
+	// to capture the peak score before reporting the event. 0 means "use the
+	// default"; a negative value disables peak hold (fire on first cross).
+	PeakHoldMs int
 	// TopN caps the score list returned by Tick (0 = every item).
 	TopN int
 }
@@ -73,6 +87,7 @@ func DefaultOptions() Options {
 		SilenceDBFS:      -60,
 		CooldownMs:       400,
 		RefractoryMs:     50,
+		PeakHoldMs:       48, // ~9 hops at 5.333 ms; enough to catch a click peak
 		TopN:             5,
 	}
 }
@@ -92,7 +107,19 @@ func (o Options) normalize() Options {
 	if o.RefractoryMs <= 0 {
 		o.RefractoryMs = DefaultOptions().RefractoryMs
 	}
+	if o.PeakHoldMs == 0 {
+		o.PeakHoldMs = DefaultOptions().PeakHoldMs
+	}
 	return o
+}
+
+// peakHold tracks a threshold-crossing candidate until its rising edge peaks
+// (or PeakHoldMs elapses / the score drops / the window goes silent).
+type peakHold struct {
+	id, name      string
+	score, margin float64
+	level         float64
+	armedAt       time.Time
 }
 
 // Engine is the detection + debounce state machine.
@@ -104,6 +131,7 @@ type Engine struct {
 	thresholds map[string]float64
 	lastFire   map[string]time.Time
 	lastAny    time.Time
+	hold       *peakHold
 
 	// diagnostics for the most recent Tick
 	pendingID     string
@@ -201,8 +229,9 @@ func (e *Engine) Pending() (id string, score float64) {
 // current top list.
 //
 // window must be a normalised unit vector of ix.Dim() values; nil (no window
-// yet) or a sub-SilenceDBFS level returns (nil, nil) without scoring. The
-// caller owns the returned slice.
+// yet) returns (nil, nil) without scoring. A sub-SilenceDBFS level skips
+// scoring but flushes an armed peak-hold as an event. The caller owns the
+// returned slice.
 func (e *Engine) Tick(window []float32, levelDBFS float64, now time.Time) (*Event, []index.ItemScore) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -214,11 +243,17 @@ func (e *Engine) Tick(window []float32, levelDBFS float64, now time.Time) (*Even
 	if levelDBFS < e.opts.SilenceDBFS || math.IsInf(levelDBFS, -1) {
 		e.skippedSilent++
 		e.pendingID, e.pendingScore = "", 0
+		if e.hold != nil {
+			return e.fireHoldLocked(now), nil
+		}
 		return nil, nil
 	}
 
 	top := e.ix.Search(window, e.opts.TopN)
 	if len(top) == 0 {
+		if e.hold != nil {
+			return e.fireHoldLocked(now), nil
+		}
 		return nil, nil
 	}
 	best := top[0]
@@ -232,6 +267,27 @@ func (e *Engine) Tick(window []float32, levelDBFS float64, now time.Time) (*Even
 	margin := math.Inf(1)
 	if !math.IsInf(second, -1) {
 		margin = bestScore - second
+	}
+
+	// Peak-hold update / flush before arming a new candidate.
+	if e.hold != nil {
+		h := e.hold
+		same := best.ID == h.id
+		if same && bestScore > h.score {
+			h.score = bestScore
+			h.margin = margin
+			h.level = levelDBFS
+			h.name = best.Name
+		}
+		drop := same && bestScore < h.score-0.02
+		elapsed := e.opts.PeakHoldMs > 0 &&
+			now.Sub(h.armedAt) >= time.Duration(e.opts.PeakHoldMs)*time.Millisecond
+		below := same && (bestScore < e.thresholdLocked(h.id) || margin < e.opts.MinMargin)
+		if !same || drop || elapsed || below {
+			return e.fireHoldLocked(now), top
+		}
+		e.pendingID, e.pendingScore = h.id, h.score
+		return nil, top
 	}
 
 	// gate: threshold (per item) and margin
@@ -254,18 +310,42 @@ func (e *Engine) Tick(window []float32, levelDBFS float64, now time.Time) (*Even
 		return nil, top
 	}
 
-	e.lastFire[best.ID] = now
+	// Peak hold disabled → fire on first cross (legacy / unit-test path).
+	if e.opts.PeakHoldMs < 0 {
+		return e.commitLocked(best.ID, best.Name, bestScore, margin, levelDBFS, now), top
+	}
+
+	e.hold = &peakHold{
+		id: best.ID, name: best.Name,
+		score: bestScore, margin: margin, level: levelDBFS,
+		armedAt: now,
+	}
+	e.pendingID, e.pendingScore = best.ID, bestScore
+	return nil, top
+}
+
+func (e *Engine) fireHoldLocked(now time.Time) *Event {
+	h := e.hold
+	if h == nil {
+		return nil
+	}
+	e.hold = nil
+	return e.commitLocked(h.id, h.name, h.score, h.margin, h.level, now)
+}
+
+func (e *Engine) commitLocked(id, name string, score, margin, level float64, now time.Time) *Event {
+	e.lastFire[id] = now
 	e.lastAny = now
 	e.fired++
 	e.pendingID, e.pendingScore = "", 0
 	return &Event{
-		ID:        best.ID,
-		Name:      best.Name,
-		Score:     bestScore,
+		ID:        id,
+		Name:      name,
+		Score:     score,
 		Margin:    margin,
 		Time:      now,
-		LevelDBFS: levelDBFS,
-	}, top
+		LevelDBFS: level,
+	}
 }
 
 // cooldown returns the per-item cooldown. Per-item overrides live in the index
@@ -291,6 +371,7 @@ func (e *Engine) Reset() {
 	defer e.mu.Unlock()
 	e.lastFire = make(map[string]time.Time)
 	e.lastAny = time.Time{}
+	e.hold = nil
 	e.pendingID, e.pendingScore = "", 0
 	e.ticks, e.fired, e.skippedSilent, e.rejected = 0, 0, 0, 0
 }

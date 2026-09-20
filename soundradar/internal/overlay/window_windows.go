@@ -301,6 +301,10 @@ type Overlay struct {
 	peakAlpha atomic.Int64
 
 	frames atomic.Int64
+
+	// cardN is how many hint tiles the current hit expanded into. 0 means the
+	// compact one-line overlay (the default).
+	cardN int
 }
 
 // New creates the overlay window and starts its message loop.
@@ -367,13 +371,57 @@ func (o *Overlay) Show(it DisplayItem) error {
 			it.Icon = img
 		}
 	}
+	o.mu.Lock()
+	wasCards := o.cardN > 0
+	o.cardN = 0
+	maxN := o.cfg.MaxSimultaneous
+	o.mu.Unlock()
+	if wasCards {
+		o.queue.SetMax(maxN)
+	}
 	o.queue.Show(it)
 	hwnd := windows.Handle(o.hwnd.Load())
 	if hwnd == 0 {
 		return errors.New("悬浮窗句柄尚未就绪")
 	}
-	// PostMessageW is the ONLY cross-thread window call: the window thread owns
-	// the HWND, so resize/blit/visibility all happen there.
+	if wasCards {
+		_ = postMessage(hwnd, wmAppConfig, 0, 0)
+	}
+	if err := postMessage(hwnd, wmAppFrame, 0, 0); err != nil {
+		return fmt.Errorf("通知窗口线程失败: %w", err)
+	}
+	return nil
+}
+
+// ShowCards replaces the overlay with one tile per grid hint. The window grows
+// to fit them and shrinks again on the next compact Show.
+func (o *Overlay) ShowCards(items []DisplayItem) error {
+	if o == nil {
+		return errors.New("悬浮窗未创建")
+	}
+	if o.closed.Load() {
+		return errors.New("悬浮窗已关闭")
+	}
+	o.mu.Lock()
+	enabled := o.cfg.Enabled
+	o.mu.Unlock()
+	if !enabled {
+		return nil
+	}
+	if len(items) == 0 {
+		return nil
+	}
+	o.mu.Lock()
+	o.cardN = len(items)
+	o.mu.Unlock()
+	o.queue.Replace(items)
+	hwnd := windows.Handle(o.hwnd.Load())
+	if hwnd == 0 {
+		return errors.New("悬浮窗句柄尚未就绪")
+	}
+	if err := postMessage(hwnd, wmAppConfig, 0, 0); err != nil {
+		return fmt.Errorf("通知窗口线程失败: %w", err)
+	}
 	if err := postMessage(hwnd, wmAppFrame, 0, 0); err != nil {
 		return fmt.Errorf("通知窗口线程失败: %w", err)
 	}
@@ -388,23 +436,21 @@ func (o *Overlay) ApplyConfig(cfg config.OverlayConfig) error {
 	if o == nil {
 		return errors.New("悬浮窗未创建")
 	}
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
 	o.mu.Lock()
 	oldEnabled := o.cfg.Enabled
-	toggle := o.toggle
 	o.cfg = cfg
 	o.mu.Unlock()
 
-	probe := &config.Config{
-		Overlay: cfg,
-		Hotkeys: config.HotkeyConfig{ToggleOverlay: toggle},
-		Profile: "default",
-	}
-	if err := probe.Validate(); err != nil {
-		return err
-	}
-
 	o.queue.SetTiming(Timing{FadeInMs: cfg.FadeInMs, DurationMs: cfg.DurationMs, FadeOutMs: cfg.FadeOutMs})
 	o.queue.SetMax(cfg.MaxSimultaneous)
+	if !cfg.ShowAll {
+		o.mu.Lock()
+		o.cardN = 0
+		o.mu.Unlock()
+	}
 
 	hwnd := windows.Handle(o.hwnd.Load())
 	if hwnd == 0 {
@@ -814,7 +860,17 @@ func (o *Overlay) createWindow() (windows.Handle, error) {
 func (o *Overlay) geometry() (x, y, w, h int, err error) {
 	o.mu.Lock()
 	cfg := o.cfg
+	n := o.cardN
 	o.mu.Unlock()
+	if cfg.ShowAll && n > 0 {
+		size := cfg.Size
+		if size <= 0 {
+			size = 96
+		}
+		w, h = CardCanvas(size, n)
+		x, y, err = config.ResolvePositionSized(cfg, Monitors(), w, h)
+		return x, y, w, h, err
+	}
 	return config.ResolvePosition(cfg, Monitors())
 }
 
@@ -842,11 +898,13 @@ func (o *Overlay) rebuildRenderer(w, h int) {
 	o.mu.Lock()
 	cfg := o.cfg
 	rend := o.renderer
+	cards := cfg.ShowAll && o.cardN > 0
 	o.mu.Unlock()
 	if rend != nil {
 		cur := rend.Options()
 		if cur.Width == w && cur.Height == h &&
-			cur.ShowName == cfg.ShowName && cur.ShowScore == cfg.ShowScore {
+			cur.ShowName == cfg.ShowName && cur.ShowScore == cfg.ShowScore &&
+			cur.CardLayout == cards {
 			return
 		}
 	}
@@ -857,6 +915,7 @@ func (o *Overlay) rebuildRenderer(w, h int) {
 	nr, err := NewRenderer(RenderOptions{
 		Width: w, Height: h, IconSize: size,
 		ShowName: cfg.ShowName, ShowScore: cfg.ShowScore, Alpha: cfg.Opacity,
+		CardLayout: cards,
 	})
 	if err != nil {
 		o.setErr(err)
@@ -889,6 +948,17 @@ func (o *Overlay) renderFrame() {
 	}
 	rend.SetAlpha(alpha)
 	canvas := rend.Draw(items, int(o.frames.Load()))
+	if len(items) == 0 {
+		o.mu.Lock()
+		shrink := o.cardN > 0
+		if shrink {
+			o.cardN = 0
+		}
+		o.mu.Unlock()
+		if shrink {
+			o.applyGeometry()
+		}
+	}
 	if err := o.blit(hwnd, canvas, o.frames.Load(), int64(alpha*1000000)); err != nil {
 		o.setErr(err)
 		return

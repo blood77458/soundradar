@@ -113,6 +113,16 @@ func TestValidateRejectsBadValuesWithChineseErrors(t *testing.T) {
 	}
 }
 
+func TestOverlayValidateDoesNotRequireHotkeys(t *testing.T) {
+	if err := Default().Overlay.Validate(); err != nil {
+		t.Fatalf("默认悬浮窗被误判为非法: %v", err)
+	}
+	bare := OverlayConfig{}
+	if err := bare.Validate(); err == nil {
+		t.Fatal("空悬浮窗配置应当拒绝")
+	}
+}
+
 // hasHan reports whether s contains at least one CJK ideograph.
 func hasHan(s string) bool {
 	for _, r := range s {

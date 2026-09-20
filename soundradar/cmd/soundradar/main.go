@@ -71,6 +71,8 @@ Usage:
                      [--wav <file>] [--x N --y N] [--size N] [--opacity F] [--csv <file>]
   soundradar recall  [--seconds N] [--at N] [--device <substr>] [--library <path>]
                      [--out <file>] [--dir <path>] [--ring N] [--json]
+  soundradar seed-tingsheng [--library <path>]
+  soundradar merge-tingsheng [--library <path>] [--icons <dir>]
   soundradar version
 
 Subcommands:
@@ -102,6 +104,10 @@ Subcommands:
   recall    Capture loopback for N seconds and trigger the recall save once
             (P4). It runs the exact code the F8 hotkey runs, but without any
             keyboard input, so it is what the acceptance script drives.
+  seed-tingsheng
+            Insert metadata-only 同音类 items (泥板/雕塑/定位/右侧C/大框杂项)
+            from the 听声鉴宝对照 doc. Skips names that already exist; no index
+            rebuild needed until you add real samples.
   version   Print version / build salt / go version and exit. Used by build.ps1
             as a zero-side-effect launch self-check (Smart App Control probe).
 
@@ -169,6 +175,10 @@ func main() {
 		err = runOverlay(os.Args[2:])
 	case "recall", "rewind":
 		err = runRecall(os.Args[2:])
+	case "seed-tingsheng":
+		err = runSeedTingsheng(os.Args[2:])
+	case "merge-tingsheng":
+		err = runMergeTingsheng(os.Args[2:])
 	case "version", "ver", "-v", "--version":
 		printVersion()
 		return

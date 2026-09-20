@@ -94,6 +94,9 @@ type OverlayConfig struct {
 	MaxSimultaneous int  `json:"maxSimultaneous"`
 	ShowName        bool `json:"showName"`
 	ShowScore       bool `json:"showScore"`
+	// ShowAll lays every grid hint out as its own card (picture, grid size,
+	// name), matching the live "识别对照" panel. Off keeps the compact one-line hit.
+	ShowAll bool `json:"showAll"`
 	// Margin is the gap to the work-area edge in anchored mode (physical px).
 	Margin int `json:"margin"`
 }
@@ -151,17 +154,16 @@ type NoiseConfig struct {
 	HighPassHz float64 `json:"highPassHz"`
 	// Strength is the over-subtraction factor: how much of the estimated noise
 	// power is assumed to be noise. Larger means stronger suppression and a
-	// slightly more altered sound. Default 2.0.
+	// slightly more altered sound. Default 1.5.
 	Strength float64 `json:"strength"`
 	// GainFloorDB bounds how far a single frequency bin may be attenuated
-	// (default -14 dB).
+	// (default -8 dB).
 	GainFloorDB float64 `json:"gainFloorDb"`
 	// AdaptiveGate raises the silence gate above the measured noise floor, so a
-	// noisy game stops scoring empty windows. The zero value means "use the
-	// default", which is on: it is omitted from the file rather than written as
-	// false, and an explicit false switches it off.
-	AdaptiveGate bool `json:"adaptiveGate,omitempty"`
-	// GateMarginDB is how far above the noise floor that gate sits. Default 6.
+	// noisy game stops scoring empty windows. Written explicitly (not omitempty)
+	// so an intentional false survives Save→Load.
+	AdaptiveGate bool `json:"adaptiveGate"`
+	// GateMarginDB is how far above the noise floor that gate sits. Default 4.
 	GateMarginDB float64 `json:"gateMarginDb"`
 	// GateFloorDBFS is the lowest value the adaptive gate may take, so a quiet
 	// environment keeps the configured gate. Default -70.
@@ -197,6 +199,7 @@ func Default() *Config {
 			MaxSimultaneous: 3,
 			ShowName:        true,
 			ShowScore:       true,
+			ShowAll:         false,
 			Margin:          24,
 		},
 		Hotkeys: HotkeyConfig{ToggleOverlay: "F9", RecallLabel: "F8"},
@@ -217,10 +220,10 @@ func DefaultNoiseConfig() NoiseConfig {
 	return NoiseConfig{
 		Method:        "subtract",
 		HighPassHz:    120,
-		Strength:      2.0,
-		GainFloorDB:   -14,
+		Strength:      1.5,
+		GainFloorDB:   -8,
 		AdaptiveGate:  true,
-		GateMarginDB:  6,
+		GateMarginDB:  4,
 		GateFloorDBFS: -70,
 	}
 }
@@ -451,8 +454,84 @@ func (c *Config) Validate() error {
 	if c == nil {
 		return errors.New("配置为空")
 	}
-	o := c.Overlay
+	if err := c.Overlay.Validate(); err != nil {
+		return err
+	}
+	if len([]rune(c.Capture.Device)) > 512 {
+		return errors.New("capture.device 名称过长（最多 512 个字符）")
+	}
+	if strings.TrimSpace(c.Profile) == "" {
+		return errors.New("profile 不能为空")
+	}
+	if len([]rune(c.Profile)) > 64 {
+		return errors.New("profile 过长（最多 64 个字符）")
+	}
+	if len([]rune(c.Hotkeys.ToggleOverlay)) > 0 {
+		if _, err := ParseHotkey(c.Hotkeys.ToggleOverlay); err != nil {
+			return fmt.Errorf("hotkeys.toggleOverlay 非法: %w", err)
+		}
+	} else {
+		return errors.New("hotkeys.toggleOverlay 不能为空（想禁用请写 none）")
+	}
+	if len([]rune(c.Hotkeys.RecallLabel)) > 0 {
+		if _, err := ParseHotkey(c.Hotkeys.RecallLabel); err != nil {
+			return fmt.Errorf("hotkeys.recallLabel 非法: %w", err)
+		}
+	} else {
+		return errors.New("hotkeys.recallLabel 不能为空（想禁用请写 none）")
+	}
 
+	// --- P4 recall -------------------------------------------------------
+	r := c.Recall
+	switch {
+	case r.Seconds < 1:
+		return fmt.Errorf("recall.seconds 至少为 1，当前 %d", r.Seconds)
+	case r.Seconds > 30:
+		return fmt.Errorf("recall.seconds 最多 30（秒），当前 %d", r.Seconds)
+	}
+	switch {
+	case r.MaxFiles < 1:
+		return fmt.Errorf("recall.maxFiles 至少为 1，当前 %d", r.MaxFiles)
+	case r.MaxFiles > 5000:
+		return fmt.Errorf("recall.maxFiles 最多 5000，当前 %d", r.MaxFiles)
+	}
+	if strings.TrimSpace(r.Dir) == "" {
+		return errors.New("recall.dir 不能为空（候选项保存目录）")
+	}
+	if len([]rune(r.Dir)) > 512 {
+		return errors.New("recall.dir 过长（最多 512 个字符）")
+	}
+	if strings.ContainsAny(r.Dir, "\x00") {
+		return errors.New("recall.dir 含非法字符")
+	}
+
+	// --- noise -----------------------------------------------------------
+	n := normalizedNoise(c.Noise)
+	if _, ok := NormalizeNoiseMethod(n.Method); !ok && strings.TrimSpace(n.Method) != "" {
+		return fmt.Errorf("noise.method 非法: %q（可选: %s）", n.Method, strings.Join(NoiseMethods, ", "))
+	}
+	if n.HighPassHz < 0 || n.HighPassHz > 4000 {
+		return fmt.Errorf("noise.highPassHz 应在 0–4000，当前 %v", n.HighPassHz)
+	}
+	if n.Strength < 0.5 || n.Strength > 6 {
+		return fmt.Errorf("noise.strength 应在 0.5–6，当前 %v", n.Strength)
+	}
+	if n.GainFloorDB > -1 || n.GainFloorDB < -40 {
+		return fmt.Errorf("noise.gainFloorDb 应在 -40–-1，当前 %v", n.GainFloorDB)
+	}
+	if n.GateMarginDB < 0 || n.GateMarginDB > 30 {
+		return fmt.Errorf("noise.gateMarginDb 应在 0–30，当前 %v", n.GateMarginDB)
+	}
+	if n.GateFloorDBFS > -20 || n.GateFloorDBFS < -100 {
+		return fmt.Errorf("noise.gateFloorDbfs 应在 -100–-20，当前 %v", n.GateFloorDBFS)
+	}
+	return nil
+}
+
+// Validate checks only the overlay section. The live overlay applies this on
+// its own, without a full config document, so it must not require hotkeys or
+// recall fields that are not part of the window.
+func (o OverlayConfig) Validate() error {
 	if len([]rune(o.Anchor)) > 0 {
 		if _, ok := NormalizeAnchor(o.Anchor); !ok {
 			return fmt.Errorf("overlay.anchor 取值非法: %q（可选值: %s）",
@@ -514,53 +593,6 @@ func (c *Config) Validate() error {
 	}
 	if abs(o.X) > 1000000 || abs(o.Y) > 1000000 {
 		return fmt.Errorf("overlay.x/y 超出合理范围（|x|=%d, |y|=%d）", abs(o.X), abs(o.Y))
-	}
-	if len([]rune(c.Capture.Device)) > 512 {
-		return errors.New("capture.device 名称过长（最多 512 个字符）")
-	}
-	if strings.TrimSpace(c.Profile) == "" {
-		return errors.New("profile 不能为空")
-	}
-	if len([]rune(c.Profile)) > 64 {
-		return errors.New("profile 过长（最多 64 个字符）")
-	}
-	if len([]rune(c.Hotkeys.ToggleOverlay)) > 0 {
-		if _, err := ParseHotkey(c.Hotkeys.ToggleOverlay); err != nil {
-			return fmt.Errorf("hotkeys.toggleOverlay 非法: %w", err)
-		}
-	} else {
-		return errors.New("hotkeys.toggleOverlay 不能为空（想禁用请写 none）")
-	}
-	if len([]rune(c.Hotkeys.RecallLabel)) > 0 {
-		if _, err := ParseHotkey(c.Hotkeys.RecallLabel); err != nil {
-			return fmt.Errorf("hotkeys.recallLabel 非法: %w", err)
-		}
-	} else {
-		return errors.New("hotkeys.recallLabel 不能为空（想禁用请写 none）")
-	}
-
-	// --- P4 recall -------------------------------------------------------
-	r := c.Recall
-	switch {
-	case r.Seconds < 1:
-		return fmt.Errorf("recall.seconds 至少为 1，当前 %d", r.Seconds)
-	case r.Seconds > 30:
-		return fmt.Errorf("recall.seconds 最多 30（秒），当前 %d", r.Seconds)
-	}
-	switch {
-	case r.MaxFiles < 1:
-		return fmt.Errorf("recall.maxFiles 至少为 1，当前 %d", r.MaxFiles)
-	case r.MaxFiles > 5000:
-		return fmt.Errorf("recall.maxFiles 最多 5000，当前 %d", r.MaxFiles)
-	}
-	if strings.TrimSpace(r.Dir) == "" {
-		return errors.New("recall.dir 不能为空（候选项保存目录）")
-	}
-	if len([]rune(r.Dir)) > 512 {
-		return errors.New("recall.dir 过长（最多 512 个字符）")
-	}
-	if strings.ContainsAny(r.Dir, "\x00") {
-		return errors.New("recall.dir 含非法字符")
 	}
 	return nil
 }

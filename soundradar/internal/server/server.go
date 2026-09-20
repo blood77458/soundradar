@@ -60,8 +60,18 @@ type OverlayBridge interface {
 	Visible() bool
 	// State returns a JSON-serialisable snapshot of the live window.
 	State() any
-	// ShowHit enqueues one recognised hit.
+	// ShowHit enqueues one recognised hit (compact: one icon + one line).
 	ShowHit(id, name string, score float64)
+	// ShowCards replaces the overlay with one card per grid hint
+	// (picture, grid size, name). Used when overlay.showAll is on.
+	ShowCards(id string, score float64, cards []OverlayCard)
+}
+
+// OverlayCard is one grid row for the expanded overlay.
+type OverlayCard struct {
+	Grid string
+	Name string
+	PNG  []byte
 }
 
 // Options configures a Server.
@@ -351,6 +361,8 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		s.handleItem(w, r, parts[1])
 	case len(parts) == 3 && parts[0] == "items" && parts[2] == "icon.png":
 		s.handleIcon(w, r, parts[1])
+	case len(parts) == 5 && parts[0] == "items" && parts[2] == "hints" && parts[4] == "icon.png":
+		s.handleHintIcon(w, r, parts[1], parts[3])
 	case len(parts) == 4 && parts[0] == "items" && parts[2] == "samples":
 		// POST   /api/items/{id}/samples
 		// DELETE /api/items/{id}/samples/{n}
@@ -464,6 +476,35 @@ func (s *Server) handleIcon(w http.ResponseWriter, r *http.Request, id string) {
 	w.Header().Set("Content-Type", "image/png")
 	w.Header().Set("Cache-Control", "no-cache")
 	http.ServeContent(w, r, "icon.png", it.UpdatedAt, bytes.NewReader(icon))
+}
+
+func (s *Server) handleHintIcon(w http.ResponseWriter, r *http.Request, id, idxPart string) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		methodNotAllowed(w, "GET")
+		return
+	}
+	n, err := strconv.Atoi(idxPart)
+	if err != nil || n < 0 {
+		writeError(w, http.StatusBadRequest, "格子序号无效: "+idxPart)
+		return
+	}
+	it := s.store.Get(id)
+	if it == nil {
+		writeError(w, http.StatusNotFound, "条目不存在: "+id)
+		return
+	}
+	if n >= len(it.DisplayHints) {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("条目 %s 只有 %d 条格子对照", id, len(it.DisplayHints)))
+		return
+	}
+	icon := it.HintIcon(n)
+	if len(icon) == 0 {
+		writeError(w, http.StatusNotFound, "该格子还没有单独的图片")
+		return
+	}
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "no-cache")
+	http.ServeContent(w, r, "hint.png", it.UpdatedAt, bytes.NewReader(icon))
 }
 
 func (s *Server) serveSampleWAV(w http.ResponseWriter, r *http.Request, id, idxPart string) {
@@ -586,13 +627,14 @@ func (s *Server) handleCreateItem(w http.ResponseWriter, r *http.Request) {
 	}
 
 	it := &library.Item{
-		Name:       name,
-		Threshold:  threshold,
-		CooldownMs: cooldown,
-		Profile:    profile,
-		Tags:       parseTagsValues(r.MultipartForm.Value["tags"]),
-		Note:       strings.TrimSpace(r.FormValue("note")),
-		Samples:    []library.Sample{newSample(conv, 0)},
+		Name:         name,
+		Threshold:    threshold,
+		CooldownMs:   cooldown,
+		Profile:      profile,
+		Tags:         parseTagsValues(r.MultipartForm.Value["tags"]),
+		Note:         strings.TrimSpace(r.FormValue("note")),
+		DisplayHints: parseDisplayHintsForm(r.FormValue("displayHints")),
+		Samples:      []library.Sample{newSample(conv, 0)},
 	}
 	if err := s.store.AddItem(it, iconPNG, [][]byte{conv.WAV}); err != nil {
 		writeStoreError(w, err)
@@ -649,6 +691,13 @@ func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request, id string) 
 		}
 		if f.Note != nil {
 			it.Note = *f.Note
+		}
+		if f.DisplayHints != nil {
+			hints, herr := library.NormalizeDisplayHints(*f.DisplayHints)
+			if herr != nil {
+				return herr
+			}
+			it.DisplayHints = hints
 		}
 		if f.Threshold != nil {
 			it.Threshold = clampFloat(*f.Threshold, 0, 1)
@@ -780,12 +829,13 @@ func newSample(conv *audio.Converted, offsetS float64) library.Sample {
 }
 
 type patchFields struct {
-	Name       *string   `json:"name"`
-	Tags       *[]string `json:"tags"`
-	Note       *string   `json:"note"`
-	Threshold  *float64  `json:"threshold"`
-	CooldownMs *int      `json:"cooldownMs"`
-	Profile    *string   `json:"profile"`
+	Name         *string                `json:"name"`
+	Tags         *[]string              `json:"tags"`
+	Note         *string                `json:"note"`
+	DisplayHints *[]library.DisplayHint `json:"displayHints"`
+	Threshold    *float64               `json:"threshold"`
+	CooldownMs   *int                   `json:"cooldownMs"`
+	Profile      *string                `json:"profile"`
 }
 
 // readPatchBody accepts either application/json or multipart/form-data (the
@@ -818,6 +868,12 @@ func readPatchBody(r *http.Request) (jsonBody []byte, icon []byte, iconName stri
 			if v := r.FormValue("cooldownMs"); v != "" {
 				obj["cooldownMs"] = int(parseFloatDefault(v, 0))
 			}
+			if v := strings.TrimSpace(r.FormValue("displayHints")); v != "" {
+				var hints []library.DisplayHint
+				if json.Unmarshal([]byte(v), &hints) == nil {
+					obj["displayHints"] = hints
+				}
+			}
 			if len(obj) > 0 {
 				jsonBody, _ = json.Marshal(obj)
 			}
@@ -846,19 +902,27 @@ func readPatchBody(r *http.Request) (jsonBody []byte, icon []byte, iconName stri
 
 // ItemDTO is the item summary returned inside the library listing.
 type ItemDTO struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	Icon        string    `json:"icon"`
-	Threshold   float64   `json:"threshold"`
-	CooldownMs  int       `json:"cooldownMs"`
-	Profile     string    `json:"profile"`
-	Tags        []string  `json:"tags"`
-	Note        string    `json:"note"`
-	SampleCount int       `json:"sampleCount"`
-	TotalLenS   float64   `json:"totalLenS"`
-	CreatedAt   time.Time `json:"createdAt"`
-	UpdatedAt   time.Time `json:"updatedAt"`
-	IconURL     string    `json:"iconUrl"`
+	ID           string                `json:"id"`
+	Name         string                `json:"name"`
+	Icon         string                `json:"icon"`
+	Threshold    float64               `json:"threshold"`
+	CooldownMs   int                   `json:"cooldownMs"`
+	Profile      string                `json:"profile"`
+	Tags         []string              `json:"tags"`
+	Note         string                `json:"note"`
+	DisplayHints []DisplayHintDTO     `json:"displayHints"`
+	SampleCount  int                   `json:"sampleCount"`
+	TotalLenS    float64               `json:"totalLenS"`
+	CreatedAt    time.Time             `json:"createdAt"`
+	UpdatedAt    time.Time             `json:"updatedAt"`
+	IconURL      string                `json:"iconUrl"`
+}
+
+// DisplayHintDTO is one grid→name row with an optional icon URL.
+type DisplayHintDTO struct {
+	Grid    string `json:"grid"`
+	Name    string `json:"name"`
+	IconURL string `json:"iconUrl,omitempty"`
 }
 
 // SampleDTO is one audio variant in the item detail response.
@@ -913,18 +977,26 @@ type LibraryDTO struct {
 
 func (s *Server) itemDTO(it *library.Item) ItemDetailDTO {
 	base := ItemDTO{
-		ID:          it.ID,
-		Name:        it.Name,
-		Icon:        it.Icon,
-		Threshold:   it.Threshold,
-		CooldownMs:  it.CooldownMs,
-		Profile:     it.Profile,
-		Tags:        append([]string{}, it.Tags...),
-		Note:        it.Note,
-		SampleCount: len(it.Samples),
-		CreatedAt:   it.CreatedAt,
-		UpdatedAt:   it.UpdatedAt,
-		IconURL:     "/api/items/" + it.ID + "/icon.png",
+		ID:           it.ID,
+		Name:         it.Name,
+		Icon:         it.Icon,
+		Threshold:    it.Threshold,
+		CooldownMs:   it.CooldownMs,
+		Profile:      it.Profile,
+		Tags:         append([]string{}, it.Tags...),
+		Note:         it.Note,
+		SampleCount:  len(it.Samples),
+		CreatedAt:    it.CreatedAt,
+		UpdatedAt:    it.UpdatedAt,
+		IconURL:      "/api/items/" + it.ID + "/icon.png",
+	}
+	base.DisplayHints = make([]DisplayHintDTO, 0, len(it.DisplayHints))
+	for i, h := range it.DisplayHints {
+		dto := DisplayHintDTO{Grid: h.Grid, Name: h.Name}
+		if len(it.HintIcon(i)) > 0 {
+			dto.IconURL = fmt.Sprintf("/api/items/%s/hints/%d/icon.png?v=%d", it.ID, i, it.UpdatedAt.Unix())
+		}
+		base.DisplayHints = append(base.DisplayHints, dto)
 	}
 	dto := ItemDetailDTO{ItemDTO: base, Samples: make([]SampleDTO, 0, len(it.Samples))}
 	for i, sm := range it.Samples {
@@ -1078,6 +1150,20 @@ func parseTagsValues(vals []string) []string {
 		}
 	}
 	return out
+}
+
+// parseDisplayHintsForm decodes a JSON array of DisplayHint from a form field.
+// Invalid or empty input yields an empty slice (validation happens in AddItem).
+func parseDisplayHintsForm(raw string) []library.DisplayHint {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var hints []library.DisplayHint
+	if err := json.Unmarshal([]byte(raw), &hints); err != nil {
+		return nil
+	}
+	return hints
 }
 
 type statusRecorder struct {

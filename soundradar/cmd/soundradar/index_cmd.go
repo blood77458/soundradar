@@ -42,15 +42,18 @@ const indexUsage = `soundradar index - 指纹索引维护
 选项:
   --library PATH  音效库文件（默认 <exe 目录>\data\library.srz）
   --out PATH      索引输出路径（默认与库文件同目录的 index.bin）
+  --config PATH   配置文件（默认 <exe 目录>\config.json；噪声段决定指纹）
 
 说明:
   对库里每个条目的每个样本计算 2048 维 log-mel 指纹，取能量最高的窗口做模板，
-  做对称 int8 量化后写入 index.bin。样本太短的会被跳过并给出警告（不会中断）。`
+  做对称 int8 量化后写入 index.bin。样本太短的会被跳过并给出警告（不会中断）。
+  指纹包含 config.json 的 noise 段：改过高通/强度后必须重建索引。`
 
 func runIndexRebuild(args []string) error {
 	fs := flag.NewFlagSet("index rebuild", flag.ContinueOnError)
 	libPath := fs.String("library", "", "library file path (default <exe dir>/data/library.srz)")
 	outPath := fs.String("out", "", "index output path (default <library dir>/index.bin)")
+	cfgPath := fs.String("config", "", "settings file (default <exe dir>/config.json); noise section selects the fingerprint")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -71,13 +74,16 @@ func runIndexRebuild(args []string) error {
 		return fmt.Errorf("索引输出路径无效: %w", err)
 	}
 
-	p := dsp.DefaultParams()
+	p := dspParamsFor(loadNoiseConfig(*cfgPath))
+	n := p.EffectiveNoise()
 	fmt.Printf("[index] 音效库     : %s\n", path)
 	fmt.Printf("[index] 输出索引   : %s\n", out)
 	fmt.Printf("[index] 特征算法   : %s v%d（%d 维 = %d Mel 带 x %d 帧）\n",
 		dsp.Algorithm, dsp.Version, p.Dim(), p.MelBands, p.WindowFrames)
 	fmt.Printf("[index] 帧参数     : %d Hz / 帧长 %d / 跳步 %d (%.3f ms) / Hann / 去直流\n",
 		p.SampleRate, p.FrameSize, p.HopSize, p.HopDurationS()*1000)
+	fmt.Printf("[index] 环境音过滤 : %s / 高通 %.0f Hz / 强度 %.1f / 自适应门限 %v\n",
+		n.Method, n.HighPassHz, n.OverSubtract, n.AdaptiveGate)
 	fmt.Printf("[index] 归一化     : %s（余弦相似度 = 点积）\n", dsp.Norm)
 	fmt.Printf("[index] 参数指纹   : %s\n", p.Fingerprint())
 	fmt.Printf("[index] 开始建索引…\n")

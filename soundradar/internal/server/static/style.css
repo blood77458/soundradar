@@ -144,6 +144,10 @@ main { padding: 20px; max-width: 1500px; margin: 0 auto; }
 .status.err { color: var(--danger); }
 .status.ok { color: var(--ok); }
 .hint { color: var(--dim); font-size: 11px; }
+.hintRows { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
+.hintRow { display: grid; grid-template-columns: 88px 1fr auto; gap: 8px; align-items: center; }
+.hintRow input { width: 100%; }
+.cardHints { color: var(--dim); font-size: 11px; margin-top: 4px; line-height: 1.35; }
 
 /* ---------- drop zones ---------- */
 .drop {
@@ -299,4 +303,37 @@ ul.events .evActions { margin-left: auto; display: flex; gap: 6px; }
 #setConfigPath { color: var(--dim); margin-top: 6px; word-break: break-all; }
 #setOverlayNote:empty { display: none; }
 #setHotkey { display: inline-block; padding-top: 7px; }
+
+/* ---------- live hit guess (grid + icons) ---------- */
+.hitGuess.empty { color: var(--dim); font-size: 13px; padding: 8px 0; }
+.hitGuessHead {
+  display: flex; align-items: center; gap: 12px; margin-bottom: 12px; flex-wrap: wrap;
+}
+.hitGuessHead img.classIcon {
+  width: 48px; height: 48px; border-radius: 8px; background: #0d1014; object-fit: contain;
+}
+.hitGuessTitle { font-size: 15px; font-weight: 600; }
+.hitGuessMeta { color: var(--dim); font-size: 12px; }
+.hitGuessGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 10px;
+}
+.hitGuessCard {
+  display: flex; flex-direction: column; align-items: center; gap: 6px;
+  padding: 10px 8px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  text-align: center;
+}
+.hitGuessCard img {
+  width: 72px; height: 72px; object-fit: contain; background: #0d1014; border-radius: 6px;
+}
+.hitGuessCard img.missingIcon {
+  background:
+    repeating-linear-gradient(45deg, #1a1f28, #1a1f28 6px, #12161c 6px, #12161c 12px);
+}
+.hitGuessCard .gridTag {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 12px; color: var(--accent); font-weight: 600;
+}
+.hitGuessCard .itemName { font-size: 13px; line-height: 1.3; }
 

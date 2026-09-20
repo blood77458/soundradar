@@ -49,6 +49,9 @@ type RenderOptions struct {
 	IconSize  int
 	ShowName  bool
 	ShowScore bool
+	// CardLayout draws each item as a tile: icon on top, grid size and name
+	// underneath. Width/Height must be CardCanvas(IconSize, n).
+	CardLayout bool
 	// Alpha is the global opacity 0..1 applied to every pixel of the canvas
 	// (this is what fade in/out animates).
 	Alpha float64
@@ -305,6 +308,8 @@ type DisplayItem struct {
 	AgeMs int
 	// ID is used only for the icon cache key (empty means "do not cache").
 	ID string
+	// Grid is the stash size ("3×2") drawn under the icon in card layout.
+	Grid string
 }
 
 // Draw composites items into a fresh RGBA canvas.
@@ -314,6 +319,9 @@ type DisplayItem struct {
 // window with no rectangle behind it.
 func (r *Renderer) Draw(items []DisplayItem, frame int) *image.RGBA {
 	o := r.opt
+	if o.CardLayout {
+		return r.drawCards(items)
+	}
 	canvas := image.NewRGBA(image.Rect(0, 0, o.Width, o.Height))
 	if len(items) == 0 {
 		return canvas
@@ -326,6 +334,105 @@ func (r *Renderer) Draw(items []DisplayItem, frame int) *image.RGBA {
 
 	applyAlpha(canvas, o.Alpha)
 	return canvas
+}
+
+// cardColMax is how many hint tiles share one row before wrapping.
+const cardColMax = 8
+
+func cardGrid(n int) (cols, rows int) {
+	if n < 1 {
+		n = 1
+	}
+	cols = n
+	if cols > cardColMax {
+		cols = cardColMax
+	}
+	rows = (n + cols - 1) / cols
+	return cols, rows
+}
+
+func cardGap(icon int) int {
+	gap := icon / 10
+	if gap < 4 {
+		gap = 4
+	}
+	if gap > 12 {
+		gap = 12
+	}
+	return gap
+}
+
+func cardTextBlock(icon int) int {
+	h := icon / 5
+	if h < 34 {
+		h = 34
+	}
+	if h > 56 {
+		h = 56
+	}
+	return h
+}
+
+// CardCanvas is the window size for n hint tiles at the given icon size.
+func CardCanvas(icon, n int) (w, h int) {
+	if icon < 48 {
+		icon = 48
+	}
+	cols, rows := cardGrid(n)
+	gap := cardGap(icon)
+	tb := cardTextBlock(icon)
+	w = cols*icon + (cols+1)*gap + 2*spacingPad
+	h = rows*(icon+tb) + (rows+1)*gap + 2*spacingPad
+	return w, h
+}
+
+// drawCards paints hint tiles: picture, then grid size and name underneath.
+func (r *Renderer) drawCards(items []DisplayItem) *image.RGBA {
+	o := r.opt
+	canvas := image.NewRGBA(image.Rect(0, 0, o.Width, o.Height))
+	if len(items) == 0 {
+		applyAlpha(canvas, o.Alpha)
+		return canvas
+	}
+	icon := o.IconSize
+	if icon < 48 {
+		icon = 48
+	}
+	cols, _ := cardGrid(len(items))
+	gap := cardGap(icon)
+	tb := cardTextBlock(icon)
+	for i := range items {
+		c := i % cols
+		row := i / cols
+		x := spacingPad + gap + c*(icon+gap)
+		y := spacingPad + gap + row*(icon+tb+gap)
+		r.drawCard(canvas, items[i], x, y, icon, tb)
+	}
+	applyAlpha(canvas, o.Alpha)
+	return canvas
+}
+
+func (r *Renderer) drawCard(dst *image.RGBA, it DisplayItem, x, y, icon, textH int) {
+	img := r.iconFor(it.ID, it.Icon, icon)
+	iw, ih := img.Bounds().Dx(), img.Bounds().Dy()
+	ix := x + (icon-iw)/2
+	iy := y + (icon-ih)/2
+	draw.Draw(dst, image.Rect(ix, iy, ix+iw, iy+ih), img, img.Bounds().Min, draw.Over)
+
+	plateY := y + icon
+	drawRoundRect(dst, x, plateY, icon, textH, 6, color.NRGBA{R: 12, G: 14, B: 18, A: 220})
+	half := textH / 2
+	grid := it.Grid
+	name := it.Name
+	if r.asciiOnly {
+		grid = asciiFold(grid)
+		name = asciiFold(name)
+	}
+	if grid == "" {
+		grid = " "
+	}
+	drawCentered(dst, r.face, grid, x, plateY, icon, half, color.NRGBA{R: 130, G: 210, B: 255, A: 255})
+	drawCentered(dst, r.face, name, x, plateY+half, icon, textH-half, color.NRGBA{R: 255, G: 255, B: 255, A: 255})
 }
 
 // drawCell paints one item inside the column starting at (x, y).

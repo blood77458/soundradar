@@ -28,6 +28,63 @@ function parseTags(s) {
     .filter(Boolean);
 }
 
+function formatHintsPreview(hints) {
+  return (hints || []).map((h) => {
+    const g = String(h.grid || '').replace(/x/gi, '×');
+    return `${g} ${h.name || ''}`.trim();
+  }).filter(Boolean).join(' · ');
+}
+
+function collectHints(containerId) {
+  const box = $(containerId);
+  if (!box) return [];
+  const out = [];
+  box.querySelectorAll('.hintRow').forEach((row) => {
+    const grid = (row.querySelector('.hintGrid') || {}).value || '';
+    const name = (row.querySelector('.hintName') || {}).value || '';
+    if (!String(grid).trim() && !String(name).trim()) return;
+    out.push({ grid: String(grid).trim(), name: String(name).trim() });
+  });
+  return out;
+}
+
+function renderHintEditor(containerId, hints) {
+  const box = $(containerId);
+  if (!box) return;
+  box.innerHTML = '';
+  const list = (hints && hints.length) ? hints : [{ grid: '', name: '' }];
+  list.forEach((h) => appendHintRow(box, h.grid || '', h.name || ''));
+}
+
+function appendHintRow(box, grid, name) {
+  const row = document.createElement('div');
+  row.className = 'hintRow';
+  const g = document.createElement('input');
+  g.type = 'text';
+  g.className = 'hintGrid';
+  g.placeholder = '3x2';
+  g.maxLength = 8;
+  g.value = grid || '';
+  const n = document.createElement('input');
+  n.type = 'text';
+  n.className = 'hintName';
+  n.placeholder = '物品名';
+  n.maxLength = 40;
+  n.value = name || '';
+  const del = document.createElement('button');
+  del.type = 'button';
+  del.className = 'btn';
+  del.textContent = '删';
+  del.onclick = () => {
+    row.remove();
+    if (!box.querySelector('.hintRow')) appendHintRow(box, '', '');
+  };
+  row.appendChild(g);
+  row.appendChild(n);
+  row.appendChild(del);
+  box.appendChild(row);
+}
+
 let bannerTimer = null;
 function banner(msg, kind) {
   const el = $('banner');
@@ -213,6 +270,12 @@ function renderGrid() {
       });
       card.appendChild(tags);
     }
+    if (it.displayHints && it.displayHints.length) {
+      const hints = document.createElement('div');
+      hints.className = 'cardHints';
+      hints.textContent = formatHintsPreview(it.displayHints);
+      card.appendChild(hints);
+    }
     grid.appendChild(card);
   }
 }
@@ -280,6 +343,7 @@ async function submitCreate(e) {
   if (state.pendingIcon) fd.append('icon', state.pendingIcon, state.pendingIcon.name);
   fd.append('tags', $('cTags').value);
   fd.append('note', $('cNote').value);
+  fd.append('displayHints', JSON.stringify(collectHints('cHints')));
   fd.append('threshold', $('cThreshold').value);
   fd.append('cooldownMs', $('cCooldown').value);
   fd.append('profile', $('cProfile').value);
@@ -308,6 +372,7 @@ function resetCreateForm() {
   $('cProfile').value = 'default';
   setPendingAudio(null);
   setPendingIcon(null);
+  renderHintEditor('cHints', []);
   setStatus('createStatus', '');
 }
 
@@ -332,6 +397,8 @@ async function loadDetail(id) {
     $('dNote').value = it.note || '';
     $('dIconInput').value = '';
     renderDetailTags(it.tags || []);
+    renderHintEditor('dHints', it.displayHints || []);
+    renderDetailHintIcons(it);
     renderSamples();
   } catch (err) {
     banner('加载条目失败：' + err.message, 'err');
@@ -347,6 +414,39 @@ function renderDetailTags(tags) {
     sp.className = 'tag';
     sp.textContent = t;
     box.appendChild(sp);
+  });
+}
+
+function renderDetailHintIcons(it) {
+  let box = $('dHintIcons');
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'dHintIcons';
+    box.className = 'hitGuessGrid';
+    const host = $('dHints');
+    if (host && host.parentNode) host.parentNode.insertBefore(box, host.nextSibling);
+  }
+  box.innerHTML = '';
+  const hints = (it && it.displayHints) || [];
+  if (!hints.length) { box.classList.add('hidden'); return; }
+  box.classList.remove('hidden');
+  hints.forEach((h, i) => {
+    const card = document.createElement('div');
+    card.className = 'hitGuessCard';
+    const img = document.createElement('img');
+    img.alt = h.name || '';
+    if (h.iconUrl) img.src = h.iconUrl;
+    else img.className = 'missingIcon';
+    card.appendChild(img);
+    const g = document.createElement('div');
+    g.className = 'gridTag';
+    g.textContent = String(h.grid || '').replace(/x/gi, '×');
+    card.appendChild(g);
+    const n = document.createElement('div');
+    n.className = 'itemName';
+    n.textContent = h.name || '';
+    card.appendChild(n);
+    box.appendChild(card);
   });
 }
 
@@ -405,6 +505,7 @@ async function saveDetail() {
     name: $('dNameInput').value.trim(),
     tags: parseTags($('dTagsInput').value),
     note: $('dNote').value,
+    displayHints: collectHints('dHints'),
     threshold: Number($('dThreshold').value),
     cooldownMs: Number($('dCooldown').value),
     profile: $('dProfile').value.trim() || 'default',
@@ -699,6 +800,7 @@ function applyLiveState(st) {
   if (st.events && st.events.length && !live.events.length) {
     live.events = st.events.slice();
     renderEvents();
+    renderHitGuess(live.events[0]);
   }
   if (st.tick) renderTick(st.tick);
   else if (st.stats) renderStats(st.stats, null);
@@ -787,7 +889,69 @@ function pushEvent(ev) {
   live.events.unshift(ev);
   if (live.events.length > 50) live.events.length = 50;
   renderEvents();
-  banner(`命中「${ev.name}」相似度 ${Number(ev.score).toFixed(3)}`, 'ok');
+  renderHitGuess(ev);
+  banner(`命中「${ev.hint || ev.name}」相似度 ${Number(ev.score).toFixed(3)}`, 'ok');
+}
+
+function renderHitGuess(ev) {
+  const box = $('hitGuess');
+  if (!box) return;
+  if (!ev || !ev.id) {
+    box.className = 'hitGuess empty';
+    box.textContent = '还没有命中。点上面的「开始」，在游戏里制造声音。';
+    return;
+  }
+  box.className = 'hitGuess';
+  box.innerHTML = '';
+
+  const head = document.createElement('div');
+  head.className = 'hitGuessHead';
+  const img = document.createElement('img');
+  img.className = 'classIcon';
+  img.alt = ev.className || ev.name || '';
+  img.src = ev.iconUrl || (`/api/items/${ev.id}/icon.png`);
+  head.appendChild(img);
+  const titles = document.createElement('div');
+  const title = document.createElement('div');
+  title.className = 'hitGuessTitle';
+  title.textContent = ev.className || ev.name || '—';
+  titles.appendChild(title);
+  const meta = document.createElement('div');
+  meta.className = 'hitGuessMeta';
+  meta.textContent = `相似度 ${Number(ev.score).toFixed(3)}` + (ev.hint ? `　${ev.hint}` : '');
+  titles.appendChild(meta);
+  head.appendChild(titles);
+  box.appendChild(head);
+
+  const hints = ev.displayHints || [];
+  if (!hints.length) {
+    const alone = document.createElement('div');
+    alone.className = 'hint';
+    alone.textContent = '该条目没有格子对照（唯一类或未配置）。';
+    box.appendChild(alone);
+    return;
+  }
+  const grid = document.createElement('div');
+  grid.className = 'hitGuessGrid';
+  hints.forEach((h, i) => {
+    const card = document.createElement('div');
+    card.className = 'hitGuessCard';
+    const hi = document.createElement('img');
+    hi.alt = h.name || '';
+    if (h.iconUrl) hi.src = h.iconUrl;
+    else hi.className = 'missingIcon';
+    card.appendChild(hi);
+    const g = document.createElement('div');
+    g.className = 'gridTag';
+    g.textContent = String(h.grid || '').replace(/x/gi, '×');
+    card.appendChild(g);
+    const n = document.createElement('div');
+    n.className = 'itemName';
+    n.textContent = h.name || '';
+    card.appendChild(n);
+    grid.appendChild(card);
+  });
+  box.appendChild(grid);
 }
 
 function renderEvents() {
@@ -803,7 +967,7 @@ function renderEvents() {
 
     const name = document.createElement('span');
     name.className = 'evName';
-    name.textContent = ev.name;
+    name.textContent = ev.hint || ev.name;
     li.appendChild(name);
 
     const meta = document.createElement('span');
@@ -940,6 +1104,7 @@ function bindSettings() {
   $('btnToggleOverlay').onclick = toggleOverlayVisible;
   $('btnSaveHotkey').onclick = saveHotkey;
   $('btnSaveRecall').onclick = saveRecall;
+  $('btnSaveNoise').onclick = saveNoise;
   $('setSize').oninput = () => { $('setSizeText').textContent = $('setSize').value + ' px'; };
   $('setOpacity').oninput = () => { $('setOpacityText').textContent = Number($('setOpacity').value).toFixed(2); };
 }
@@ -1034,6 +1199,7 @@ function applyConfigToForm(cfg) {
   $('setMaxSim').value = numText(o.maxSimultaneous) === '—' ? 1 : o.maxSimultaneous;
   $('setShowName').checked = !!o.showName;
   $('setShowScore').checked = !!o.showScore;
+  $('setShowAll').checked = !!o.showAll;
   $('setHotkeyInput').value = h.toggleOverlay || 'none';
   setAnchor(o.anchor || '');
 
@@ -1044,6 +1210,18 @@ function applyConfigToForm(cfg) {
   $('setRecallMax').value = numText(r.maxFiles) === '—' ? 200 : r.maxFiles;
   $('setRecallDir').value = r.dir || 'data/candidates';
   $('setRecallEnabled').checked = r.enabled !== false;
+
+  const n = c.noise || {};
+  $('setNoiseMethod').value = n.method || 'subtract';
+  $('setNoiseHighPass').value = numText(n.highPassHz) === '—' ? 120 : n.highPassHz;
+  $('setNoiseStrength').value = numText(n.strength) === '—' ? 2 : n.strength;
+  $('setNoiseGainFloor').value = numText(n.gainFloorDb) === '—' ? -14 : n.gainFloorDb;
+  $('setNoiseGateMargin').value = numText(n.gateMarginDb) === '—' ? 6 : n.gateMarginDb;
+  $('setNoiseGateFloor').value = numText(n.gateFloorDbfs) === '—' ? -70 : n.gateFloorDbfs;
+  $('setNoiseAdaptive').checked = n.adaptiveGate !== false;
+  setText('setNoiseState',
+    `当前：${n.method || 'subtract'}　高通 ${numText(n.highPassHz)} Hz　强度 ${numText(n.strength)}　` +
+    `自适应门限 ${n.adaptiveGate !== false ? '开' : '关'}（裕量 ${numText(n.gateMarginDb)} dB）`);
 
   $('setConfigPath').textContent = `配置文件：${cfg.path}　·　来源 ${cfg.source}` +
     (cfg.writable ? '' : '　·　不可写');
@@ -1230,6 +1408,7 @@ function applyOverlaySettings() {
       maxSimultaneous: Number($('setMaxSim').value) || 1,
       showName: !!$('setShowName').checked,
       showScore: !!$('setShowScore').checked,
+      showAll: !!$('setShowAll').checked,
     },
   };
   return patchConfig(body, 'setStatus');
@@ -1290,6 +1469,30 @@ async function saveRecall() {
   if (ok) {
     await loadRecallStatus();
     banner('回溯保存设置已保存（热键改动需要重启 overlay/serve/live 才生效）', 'ok');
+  }
+}
+
+/** 保存环境音过滤参数；服务端会按新指纹重建索引。 */
+async function saveNoise() {
+  const body = {
+    noise: {
+      method: $('setNoiseMethod').value || 'subtract',
+      highPassHz: Number($('setNoiseHighPass').value),
+      strength: Number($('setNoiseStrength').value),
+      gainFloorDb: Number($('setNoiseGainFloor').value),
+      adaptiveGate: !!$('setNoiseAdaptive').checked,
+      gateMarginDb: Number($('setNoiseGateMargin').value),
+      gateFloorDbfs: Number($('setNoiseGateFloor').value),
+    },
+  };
+  const ok = await patchConfig(body, 'setNoiseStatus');
+  if (ok) {
+    try {
+      const cfg = await api('/api/config');
+      settings.config = cfg;
+      applyConfigToForm(cfg);
+    } catch (e) { /* ignore */ }
+    banner('环境音设置已保存；若实时识别在跑，请先停止再启动', 'ok');
   }
 }
 
@@ -1429,6 +1632,24 @@ function renderCandidates() {
     noteField.appendChild(noteInput);
     form.appendChild(noteField);
 
+    const hintsField = document.createElement('div');
+    hintsField.className = 'field';
+    const hintsLabel = document.createElement('label');
+    hintsLabel.textContent = '格子对照（新建条目时可选）';
+    const hintsBox = document.createElement('div');
+    hintsBox.className = 'hintRows';
+    hintsBox.id = 'candHints_' + c.id;
+    const hintsAdd = document.createElement('button');
+    hintsAdd.type = 'button';
+    hintsAdd.className = 'btn';
+    hintsAdd.textContent = '＋ 增加一行';
+    hintsAdd.onclick = () => appendHintRow(hintsBox, '', '');
+    hintsField.appendChild(hintsLabel);
+    hintsField.appendChild(hintsBox);
+    hintsField.appendChild(hintsAdd);
+    form.appendChild(hintsField);
+    appendHintRow(hintsBox, '', '');
+
     const row2 = document.createElement('div');
     row2.className = 'livebar';
     const modeField = document.createElement('div');
@@ -1556,7 +1777,13 @@ async function promoteCandidate(id) {
   }
 
   const fd = new FormData();
-  fd.append('promote', JSON.stringify({ name, tags, note, targetItemId: target }));
+  fd.append('promote', JSON.stringify({
+    name,
+    tags,
+    note,
+    targetItemId: target,
+    displayHints: target ? undefined : collectHints('candHints_' + id),
+  }));
   if (iconFile) fd.append('icon', iconFile, iconFile.name);
 
   setStatus('candStatus_' + id, '提交中…');
@@ -1602,6 +1829,9 @@ function init() {
   $('btnSave').onclick = saveDetail;
   $('btnDelete').onclick = deleteItem;
   $('btnAddSample').onclick = addSample;
+  if ($('btnAddCHint')) $('btnAddCHint').onclick = () => appendHintRow($('cHints'), '', '');
+  if ($('btnAddDHint')) $('btnAddDHint').onclick = () => appendHintRow($('dHints'), '', '');
+  renderHintEditor('cHints', []);
 
   window.addEventListener('hashchange', route);
   window.addEventListener('beforeunload', () => live.disconnect());

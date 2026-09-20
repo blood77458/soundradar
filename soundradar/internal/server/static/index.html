@@ -112,6 +112,13 @@
             <textarea id="cNote" rows="3" placeholder="例如：搜包完成时听到的那声"></textarea>
           </div>
 
+          <div class="field">
+            <label>格子对照（同音类 · 可选）</label>
+            <div class="hint">一行：格子 WxH + 可能物品名。命中后面板/悬浮窗会拼成「类名｜3×2 泥板 / 2×2 理想国」。</div>
+            <div id="cHints" class="hintRows"></div>
+            <button type="button" class="btn" id="btnAddCHint">＋ 增加一行</button>
+          </div>
+
           <div class="formActions">
             <button type="submit" class="btn primary" id="btnCreate">提交</button>
             <button type="button" class="btn" id="btnCreateCancel">取消</button>
@@ -164,6 +171,12 @@
         <div class="field">
           <label for="dNote">备注</label>
           <textarea id="dNote" rows="2"></textarea>
+        </div>
+        <div class="field">
+          <label>格子对照（同音类 · 可选）</label>
+          <div class="hint">仅展示用，不参与指纹；改提示无需重建索引。</div>
+          <div id="dHints" class="hintRows"></div>
+          <button type="button" class="btn" id="btnAddDHint">＋ 增加一行</button>
         </div>
         <div class="field">
           <label>更换图标（png / jpg，可选）</label>
@@ -239,6 +252,12 @@
         </div>
         <div class="liveStats mono" id="liveStats">—</div>
         <div class="liveStats mono" id="liveWarn"></div>
+      </div>
+
+      <div class="panel" id="hitGuessPanel">
+        <h2>识别对照（格子 → 可能物品）</h2>
+        <div class="hint">命中同音类后，在此查看格子尺寸与对应物品图。唯一类会显示单行。</div>
+        <div id="hitGuess" class="hitGuess empty">还没有命中。点上面的「开始」，在游戏里制造声音。</div>
       </div>
 
       <div class="panel">
@@ -400,8 +419,10 @@
             <label>显示内容</label>
             <label class="check"><input type="checkbox" id="setShowName" /> 显示名称</label>
             <label class="check"><input type="checkbox" id="setShowScore" /> 显示分数</label>
+            <label class="check"><input type="checkbox" id="setShowAll" /> 全部展示格子对照</label>
           </div>
         </div>
+        <div class="hint">默认关闭：悬浮窗仍是现在的单行命中。打开后，一次命中会铺开该类的全部格子，每格是图片，底部是格子数和名称（与实时页「识别对照」相同）。</div>
       </div>
 
       <div class="panel">
@@ -434,6 +455,51 @@
           </div>
         </div>
         <div class="hint">接受的写法：F1..F24、A..Z、0..9，可选 Ctrl+ / Alt+ / Shift+ / Win+ 前缀（例如 Ctrl+Alt+F9），或者填 none 表示不注册热键。</div>
+      </div>
+
+      <div class="panel">
+        <h2>环境音过滤</h2>
+        <div class="grid3">
+          <div class="field">
+            <label for="setNoiseMethod">过滤方式</label>
+            <select id="setNoiseMethod">
+              <option value="subtract">谱减（推荐）</option>
+              <option value="highpass">仅高通</option>
+              <option value="off">关闭</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="setNoiseHighPass">高通截止（Hz）</label>
+            <input type="number" id="setNoiseHighPass" min="0" max="4000" step="10" />
+          </div>
+          <div class="field">
+            <label for="setNoiseStrength">谱减强度</label>
+            <input type="number" id="setNoiseStrength" min="0.5" max="6" step="0.1" />
+          </div>
+        </div>
+        <div class="grid3">
+          <div class="field">
+            <label for="setNoiseGainFloor">单频衰减下限（dB）</label>
+            <input type="number" id="setNoiseGainFloor" min="-40" max="-1" step="1" />
+          </div>
+          <div class="field">
+            <label for="setNoiseGateMargin">自适应门限裕量（dB）</label>
+            <input type="number" id="setNoiseGateMargin" min="0" max="30" step="1" />
+          </div>
+          <div class="field">
+            <label for="setNoiseGateFloor">门限下限（dBFS）</label>
+            <input type="number" id="setNoiseGateFloor" min="-100" max="-20" step="1" />
+          </div>
+        </div>
+        <div class="livebar">
+          <label class="check"><input type="checkbox" id="setNoiseAdaptive" /> 自适应静音门限（按噪声底抬高）</label>
+          <div class="liveActions">
+            <button class="btn primary" id="btnSaveNoise">保存环境音设置</button>
+            <span class="status" id="setNoiseStatus"></span>
+          </div>
+        </div>
+        <div class="hint">针对游戏房间底噪：高通建议 200–300 Hz，强度 2–3。保存后会按新参数自动重建索引；若正在实时识别，请先停再开一次。</div>
+        <div class="mono stateLine" id="setNoiseState">—</div>
       </div>
 
       <div class="panel">

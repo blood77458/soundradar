@@ -98,6 +98,8 @@ func probe(t *testing.T, freq float64) []float32 {
 // newTestEngine builds an engine over the three-tone index.
 func newTestEngine(t *testing.T, opts Options) *Engine {
 	t.Helper()
+	// Gate unit tests expect first-cross fire; peak-hold has its own coverage.
+	opts.PeakHoldMs = -1
 	return NewEngine(newTestIndex(t), opts)
 }
 
@@ -329,7 +331,7 @@ func TestEngineOptionsNormalize(t *testing.T) {
 	// An all-zero Options must not disable every gate.
 	e := NewEngine(nil, Options{})
 	o := e.Options()
-	if o.DefaultThreshold <= 0 || o.CooldownMs <= 0 || o.RefractoryMs <= 0 || o.SilenceDBFS == 0 {
+	if o.DefaultThreshold <= 0 || o.CooldownMs <= 0 || o.RefractoryMs <= 0 || o.SilenceDBFS == 0 || o.PeakHoldMs <= 0 {
 		t.Fatalf("零值 Options 没有被补全: %+v", o)
 	}
 	// A nil index is legal and inert.
@@ -337,6 +339,56 @@ func TestEngineOptionsNormalize(t *testing.T) {
 	if ev, top := e2.Tick([]float32{1, 0, 0}, 0, time.Now()); ev != nil || top != nil {
 		t.Fatalf("nil 索引应返回 (nil, nil)，得到 %v / %v", ev, top)
 	}
+}
+
+func TestPeakHoldReportsPeakNotFirstCross(t *testing.T) {
+	opts := DefaultOptions()
+	opts.PeakHoldMs = 40
+	e := NewEngine(newTestIndex(t), opts)
+	q := engineQuery(t, e, 0)
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	ev, _ := e.Tick(q, -20, now)
+	if ev != nil {
+		t.Fatal("过线第一窗应进入 peak-hold，不应立刻报事件")
+	}
+	id, score := e.Pending()
+	if id == "" || score < 0.9 {
+		t.Fatalf("hold 中 Pending 应是高分候选，得到 %s %.4f", id, score)
+	}
+
+	// Silence before hold expires flushes the held peak.
+	ev, _ = e.Tick(q, -80, now.Add(10*time.Millisecond))
+	if ev == nil {
+		t.Fatal("静音应冲刷 peak-hold 并报出峰值事件")
+	}
+	if ev.Score < 0.9 {
+		t.Fatalf("冲刷分数 %.4f 太低", ev.Score)
+	}
+	t.Logf("peak-hold 静音冲刷: %s %.4f", ev.Name, ev.Score)
+}
+
+func TestPeakHoldElapsedFiresPeak(t *testing.T) {
+	opts := DefaultOptions()
+	opts.PeakHoldMs = 40
+	e := NewEngine(newTestIndex(t), opts)
+	q := engineQuery(t, e, 0)
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	if ev, _ := e.Tick(q, -20, now); ev != nil {
+		t.Fatal("第一窗不应立刻命中")
+	}
+	if ev, _ := e.Tick(q, -20, now.Add(20*time.Millisecond)); ev != nil {
+		t.Fatal("hold 未到期且分数未掉时不应命中")
+	}
+	ev, _ := e.Tick(q, -20, now.Add(45*time.Millisecond))
+	if ev == nil {
+		t.Fatal("PeakHoldMs 到期后应当命中")
+	}
+	if ev.Score < 0.9 {
+		t.Fatalf("到期命中分数 %.4f 太低", ev.Score)
+	}
+	t.Logf("peak-hold 到期命中: %s %.4f", ev.Name, ev.Score)
 }
 
 func TestEngineReset(t *testing.T) {

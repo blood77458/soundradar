@@ -61,10 +61,9 @@ func Identify(ix *index.Index, pcm []float32, topN int) (*IdentifyResult, error)
 	if ix.Empty() {
 		return nil, errors.New("live: 索引里一个模板都没有（先往库里加音效样本）")
 	}
-	p := dsp.DefaultParams()
-	if ix.Fingerprint() != p.Fingerprint() {
-		return nil, fmt.Errorf("live: 索引指纹 %s 与当前特征参数 %s 不一致，请重建索引",
-			shortFP(ix.Fingerprint()), shortFP(p.Fingerprint()))
+	p := ix.Params()
+	if err := p.Validate(); err != nil {
+		return nil, fmt.Errorf("live: 索引特征参数无效: %w", err)
 	}
 	start := time.Now()
 	an, err := dsp.NewAnalyzer(p)

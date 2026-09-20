@@ -99,7 +99,7 @@ type NoiseParams struct {
 	// sits well below its mean) and it is the main "how aggressive" knob.
 	OverSubtract float64 `json:"overSubtract"`
 	// GainFloorDB bounds how far ONE bin may be attenuated. It is a gain in dB
-	// (default -14 dB, i.e. a bin whose SNR is hopeless is kept at 0.2 of its
+	// (default -8 dB, i.e. a bin whose SNR is hopeless is kept at about 0.4 of its
 	// power), not a fraction of the original power: a floor expressed as
 	// "keep x % of the power" would clamp every quiet bin to the same value and
 	// leave the noise's spectral shape in the patch, which is exactly what
@@ -139,7 +139,7 @@ type NoiseParams struct {
 	// AdaptiveGate lifts the silence gate above the measured noise floor.
 	AdaptiveGate bool `json:"adaptiveGate"`
 	// GateMarginDB is how far above the noise floor the adaptive gate sits
-	// (default 6 dB) and GateFloorDBFS is the lowest value it may take
+	// (default 4 dB) and GateFloorDBFS is the lowest value it may take
 	// (default -70 dBFS), so a digitally quiet passage keeps the configured
 	// gate.
 	GateMarginDB  float64 `json:"gateMarginDb"`
@@ -151,13 +151,13 @@ func DefaultNoiseParams() NoiseParams {
 	return NoiseParams{
 		Method:        NoiseSpectral,
 		HighPassHz:    120,
-		OverSubtract:  2.0,
-		GainFloorDB:   -14,
+		OverSubtract:  1.5,
+		GainFloorDB:   -8,
 		Mix:           1.0,
 		TrackFrames:   24,
 		FrameGateDB:   -1, // disabled; see the field documentation
 		AdaptiveGate:  true,
-		GateMarginDB:  6,
+		GateMarginDB:  4,
 		GateFloorDBFS: -70,
 	}
 }
@@ -347,7 +347,8 @@ const (
 	// gaps between sound effects.
 	peakDecayPerBlock = 0.0014
 	// gateMinRangeDB is how much dynamic range the tracker must have seen before
-	// the adaptive gate is allowed to open above the configured one.
+	// the adaptive gate is allowed to open above the configured one for LOUD
+	// continuous material.
 	//
 	// It exists because the floor tracker cannot tell "quiet between sounds" from
 	// "a continuous sound": for a steady drone, music bed or an engine looping
@@ -355,8 +356,15 @@ const (
 	// adaptive gate would set its threshold right on top of the thing it is
 	// supposed to detect - the sound would never be scored at all. Requiring the
 	// peak to stand clear of the floor means the gate only engages when there
-	// really is silence between events, which is exactly when it helps.
+	// really is silence between events — except for quiet continuous room tone
+	// (see gateQuietCeilingDBFS), which must still raise the gate so ambience
+	// alone cannot flood the matcher.
 	gateMinRangeDB = 12
+	// gateQuietCeilingDBFS: when dynamic range is missing, still raise the
+	// adaptive gate if the tracked floor is at or below this level. Measured
+	// game room-tone sits around -50..-55 dBFS; continuous content (BGM, engine)
+	// sits well above -42 and keeps the configured gate instead.
+	gateQuietCeilingDBFS = -42
 )
 
 // noiseReducer is the streaming state of the front-end. Like Analyzer it is
@@ -762,18 +770,22 @@ func (r *noiseReducer) NoiseFloorDBFS() float64 {
 // gateDBFS is the adaptive silence gate for a configured absolute gate. It only
 // ever RAISES the gate (a noise floor below the configured silence gate leaves
 // the configuration alone), it is clamped to GateFloorDBFS, and it only engages
-// when the audio has shown enough dynamic range to prove that the tracked floor
-// is really silence rather than a continuous sound (see gateMinRangeDB).
+// when either (a) the audio has shown enough dynamic range to prove that the
+// tracked floor is really silence rather than a continuous loud sound, or
+// (b) the floor itself is quiet enough to be room tone (see gateQuietCeilingDBFS).
 func (r *noiseReducer) gateDBFS(configured float64) float64 {
 	if r == nil || !r.p.AdaptiveGate || !r.floorInit || r.floor <= 0 || r.peak <= 0 {
 		return configured
 	}
+	floorDB := r.NoiseFloorDBFS()
 	if 10*math.Log10(r.peak/r.floor) < gateMinRangeDB {
-		// No clear silence between events: the tracker is following the
-		// material itself, so trust the configured gate instead.
-		return configured
+		// No clear silence between events. Quiet continuous ambience still
+		// raises the gate; a continuous loud bed must not.
+		if floorDB > gateQuietCeilingDBFS {
+			return configured
+		}
 	}
-	g := r.NoiseFloorDBFS() + r.p.GateMarginDB
+	g := floorDB + r.p.GateMarginDB
 	if g < r.p.GateFloorDBFS {
 		g = r.p.GateFloorDBFS
 	}

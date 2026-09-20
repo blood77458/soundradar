@@ -249,7 +249,7 @@ func TestNoiseGateBehaviour(t *testing.T) {
 	}
 
 	// A quiet ambience with loud bursts in between: the tracker sees real
-	// silence, so the gate must rise to floor+6 dB.
+	// silence, so the gate must rise to floor+margin dB.
 	rng := rand.New(rand.NewSource(3))
 	loud, err := NewAnalyzer(p)
 	if err != nil {
@@ -267,15 +267,16 @@ func TestNoiseGateBehaviour(t *testing.T) {
 	floor := loud.NoiseFloorDBFS()
 	gate := loud.GateDBFS(-60)
 	t.Logf("有起有伏的音频：噪声底 %.2f dBFS -> 门限 %.2f dBFS（配置值 -60）", floor, gate)
-	if math.Abs(gate-(floor+6)) > 1.0 {
-		t.Fatalf("自适应门限 %.2f 不是噪声底 %.2f 加 6 dB", gate, floor)
+	margin := p.Noise.GateMarginDB
+	if math.Abs(gate-(floor+margin)) > 1.0 {
+		t.Fatalf("自适应门限 %.2f 不是噪声底 %.2f 加 %.0f dB", gate, floor, margin)
 	}
 	if gate <= -60 {
 		t.Fatalf("自适应门限 %.2f 没有抬到配置值 -60 以上", gate)
 	}
 
-	// A CONTINUOUS sound has no measurable silence: the tracker cannot tell it
-	// apart from a noise floor, so the gate must stay at the configured value
+	// A CONTINUOUS LOUD sound has no measurable silence: the tracker cannot tell
+	// it apart from a noise floor, so the gate must stay at the configured value
 	// instead of rising above the sound and silencing it forever.
 	steady, err := NewAnalyzer(p)
 	if err != nil {
@@ -287,10 +288,33 @@ func TestNoiseGateBehaviour(t *testing.T) {
 	}
 	steady.Push(tone)
 	if gate := steady.GateDBFS(-60); gate != -60 {
-		t.Fatalf("持续音的门限被抬到 %.2f，会把自己彻底屏蔽掉（应当保持 -60）", gate)
+		t.Fatalf("持续响音的门限被抬到 %.2f，会把自己彻底屏蔽掉（应当保持 -60）", gate)
 	}
-	t.Logf("持续 880 Hz 音：噪声底 %.2f dBFS -> 门限 %.2f dBFS（保持配置值）",
+	t.Logf("持续 880 Hz 响音：噪声底 %.2f dBFS -> 门限 %.2f dBFS（保持配置值）",
 		steady.NoiseFloorDBFS(), steady.GateDBFS(-60))
+
+	// Quiet continuous room tone (no bursts) must still raise the gate: otherwise
+	// game ambience at ~-52 dBFS keeps the configured -60 gate and floods the
+	// matcher with 0.6+ cosine hits against soft library items.
+	amb, err := NewAnalyzer(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ambAmp := math.Pow(10, -52.0/20)
+	room := make([]float32, 96000)
+	for i := range room {
+		room[i] = float32((rng.Float64()*2 - 1) * ambAmp * math.Sqrt(3))
+	}
+	amb.Push(room)
+	ambFloor := amb.NoiseFloorDBFS()
+	ambGate := amb.GateDBFS(-60)
+	t.Logf("持续安静环境音：噪声底 %.2f dBFS -> 门限 %.2f dBFS（配置值 -60）", ambFloor, ambGate)
+	if ambGate <= -60 {
+		t.Fatalf("安静持续环境音的自适应门限 %.2f 没有抬到配置值 -60 以上（底 %.2f）", ambGate, ambFloor)
+	}
+	if math.Abs(ambGate-(ambFloor+p.Noise.GateMarginDB)) > 1.5 {
+		t.Fatalf("安静环境音门限 %.2f 不是噪声底 %.2f 加 %.0f dB", ambGate, ambFloor, p.Noise.GateMarginDB)
+	}
 }
 
 // ---------------------------------------------------------------------------

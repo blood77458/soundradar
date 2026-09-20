@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/znz/soundradar/internal/config"
-	"github.com/znz/soundradar/internal/dsp"
 	"github.com/znz/soundradar/internal/index"
 	"github.com/znz/soundradar/internal/library"
 	"github.com/znz/soundradar/internal/overlay"
@@ -141,7 +140,7 @@ func runServe(args []string) error {
 		})
 
 		var ix *index.Index
-		if built, _, _, berr := index.LoadOrBuild(path, index.DefaultPathFor(path), dsp.DefaultParams()); berr == nil && !built.Empty() {
+		if built, _, _, berr := index.LoadOrBuild(path, index.DefaultPathFor(path), params); berr == nil && !built.Empty() {
 			ix = built
 		}
 
@@ -150,6 +149,7 @@ func runServe(args []string) error {
 		var capMu sync.Mutex
 		var cap *captureRecorder
 		var liveOn bool
+		var liveEpoch uint64
 		startCap := func() {
 			capMu.Lock()
 			defer capMu.Unlock()
@@ -176,14 +176,32 @@ func runServe(args []string) error {
 		startCap()
 		defer stopCap()
 		srv.SetAudioFeed(rec.Buffer, func(running bool) {
-			capMu.Lock()
-			liveOn = running
-			capMu.Unlock()
 			if running {
+				capMu.Lock()
+				liveEpoch++
+				liveOn = true
+				epoch := liveEpoch
+				capMu.Unlock()
+				_ = epoch
 				stopCap()
 				return
 			}
-			startCap()
+			// Resume fallback off the live-stop path. A new live session bumps
+			// liveEpoch so a late startCap cannot steal the endpoint again.
+			capMu.Lock()
+			liveOn = false
+			epoch := liveEpoch
+			capMu.Unlock()
+			go func(ep uint64) {
+				time.Sleep(150 * time.Millisecond)
+				capMu.Lock()
+				stillIdle := !liveOn && liveEpoch == ep && cap == nil
+				capMu.Unlock()
+				if !stillIdle {
+					return
+				}
+				startCap()
+			}(epoch)
 		})
 
 		srv.SetRecall(server.NewRecallSink(server.RecallOptions{
