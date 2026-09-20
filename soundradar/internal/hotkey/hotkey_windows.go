@@ -32,6 +32,9 @@ var (
 	procPeekMessage     = user32.NewProc("PeekMessageW")
 	procRegisterHotKey  = user32.NewProc("RegisterHotKey")
 	procUnregisterHK    = user32.NewProc("UnregisterHotKey")
+	procGetAsyncKeyState = user32.NewProc("GetAsyncKeyState")
+	procSetTimer        = user32.NewProc("SetTimer")
+	procKillTimer       = user32.NewProc("KillTimer")
 	procGetCurrentTID   = kernel32.NewProc("GetCurrentThreadId")
 )
 
@@ -39,10 +42,14 @@ var (
 const (
 	wmDestroy = 0x0002
 	wmClose   = 0x0010
+	wmTimer   = 0x0113
 	wmHotkey  = 0x0312
 	// wmAppCmd is posted by other goroutines to wake GetMessageW. It carries no
 	// payload; the actual Register/Unregister/Close request sits on cmdCh.
 	wmAppCmd = 0x8000 + 1
+
+	timerIDPoll = 1
+	pollEveryMs = 20
 )
 
 // hwndMessage is HWND_MESSAGE ((HWND)-3): a message-only window. It is never
@@ -94,13 +101,16 @@ var wndProcRef func(hwnd windows.Handle, msg uint32, wparam, lparam uintptr) uin
 // immediately and reports the real RegisterHotKey result.
 func NewManager() (*Manager, error) {
 	m := &Manager{
-		cmdCh: make(chan command, 8),
-		done:  make(chan struct{}),
-		regs:  make(map[string]string),
-		fns:   make(map[string]func()),
-		errs:  make(map[string]string),
-		defs:  make(map[string]string),
-		ids:   make(map[string]int),
+		cmdCh:    make(chan command, 8),
+		done:     make(chan struct{}),
+		regs:     make(map[string]string),
+		fns:      make(map[string]func()),
+		errs:     make(map[string]string),
+		defs:     make(map[string]string),
+		ids:      make(map[string]int),
+		polls:    make(map[string]pollBind),
+		pollDown: make(map[string]bool),
+		lastFire: make(map[string]time.Time),
 	}
 	ready := make(chan error, 1)
 	go m.windowThread(ready)
@@ -146,7 +156,10 @@ func (m *Manager) windowThread(ready chan<- error) {
 	m.mu.Unlock()
 
 	className := fmt.Sprintf("SoundRadarHotkey_%d", tid)
+	// Poll GetAsyncKeyState so a game that swallows WM_HOTKEY still delivers.
+	procSetTimer.Call(uintptr(hwnd), timerIDPoll, pollEveryMs, 0)
 	defer func() {
+		procKillTimer.Call(uintptr(hwnd), timerIDPoll)
 		procDestroyWindow.Call(uintptr(hwnd))
 		procUnregisterClass.Call(uintptr(unsafe.Pointer(utf16Ptr(className))), 0)
 		m.mu.Lock()
@@ -174,6 +187,10 @@ func (m *Manager) windowThread(ready chan<- error) {
 			// Handle it here and do not also DispatchMessageW: wndProc would
 			// fire the callback a second time.
 			m.handleHotkey(int(msg.WParam))
+		case wmTimer:
+			if msg.WParam == timerIDPoll {
+				m.pollKeys()
+			}
 		default:
 			procTranslateMsg.Call(uintptr(unsafe.Pointer(&msg)))
 			procDispatchMsg.Call(uintptr(unsafe.Pointer(&msg)))
@@ -284,7 +301,10 @@ func drainThreadQueue() {
 // hotkey registration (message thread only)
 // ---------------------------------------------------------------------------
 
-// doRegister calls RegisterHotKey for a name and returns its Win32 id.
+// doRegister calls RegisterHotKey for a name and arms the GetAsyncKeyState
+// poller. RegisterHotKey failure is soft: many games swallow WM_HOTKEY while
+// the physical key still shows up on GetAsyncKeyState, so polling alone is
+// enough for recall to work in-game.
 func (m *Manager) doRegister(hwnd windows.Handle, name, spec string) (int, error) {
 	hk, err := config.ParseHotkey(spec)
 	if err != nil {
@@ -293,6 +313,8 @@ func (m *Manager) doRegister(hwnd windows.Handle, name, spec string) (int, error
 	if hk.VK == 0 {
 		return 0, nil
 	}
+	mods := hk.Modifiers &^ config.ModNoRepeat
+
 	// Re-registering the same name on the same thread fails with
 	// ERROR_HOTKEY_ALREADY_REGISTERED, so release the old id first.
 	m.mu.Lock()
@@ -300,6 +322,8 @@ func (m *Manager) doRegister(hwnd windows.Handle, name, spec string) (int, error
 		procUnregisterHK.Call(uintptr(hwnd), uintptr(old))
 		delete(m.ids, name)
 	}
+	m.polls[name] = pollBind{vk: hk.VK, mods: mods}
+	m.pollDown[name] = false
 	m.nextID++
 	id := m.nextID
 	m.ids[name] = id
@@ -308,12 +332,76 @@ func (m *Manager) doRegister(hwnd windows.Handle, name, spec string) (int, error
 	ret, _, callErr := procRegisterHotKey.Call(uintptr(hwnd), uintptr(id),
 		uintptr(hk.Modifiers), uintptr(hk.VK))
 	if ret == 0 {
+		// Keep the poll arm and the id bookkeeping (id is unused for WM_HOTKEY
+		// when registration failed). Soft-warn only.
 		m.mu.Lock()
-		delete(m.ids, name)
+		delete(m.ids, name) // no WM_HOTKEY id
 		m.mu.Unlock()
-		return 0, registerError(hk, callErr)
+		_ = registerError(hk, callErr) // retained for callers that still log
+		// Return success with id 0: polling is armed.
+		return 0, nil
 	}
 	return id, nil
+}
+
+// pollKeys runs on the message thread (WM_TIMER). It fires on a rising edge of
+// the bound key with the exact modifier set, and shares debounce with WM_HOTKEY.
+func (m *Manager) pollKeys() {
+	m.mu.Lock()
+	type hit struct {
+		name string
+		fn   func()
+	}
+	var hits []hit
+	now := time.Now()
+	for name, bind := range m.polls {
+		down := keyDown(bind.vk) && modsMatch(bind.mods)
+		was := m.pollDown[name]
+		m.pollDown[name] = down
+		if !down || was {
+			continue
+		}
+		if last, ok := m.lastFire[name]; ok && now.Sub(last) < fireDebounce {
+			continue
+		}
+		fn := m.fns[name]
+		if fn == nil {
+			continue
+		}
+		m.lastFire[name] = now
+		hits = append(hits, hit{name: name, fn: fn})
+	}
+	m.mu.Unlock()
+	for _, h := range hits {
+		go h.fn()
+	}
+}
+
+func keyDown(vk uint32) bool {
+	r, _, _ := procGetAsyncKeyState.Call(uintptr(vk))
+	return r&0x8000 != 0
+}
+
+// modsMatch requires the registered modifiers to be down and every other
+// modifier to be up, matching RegisterHotKey's exact-mask behaviour.
+func modsMatch(want uint32) bool {
+	ctrl := keyDown(0x11) || keyDown(0xA2) || keyDown(0xA3)
+	alt := keyDown(0x12) || keyDown(0xA4) || keyDown(0xA5)
+	shift := keyDown(0x10) || keyDown(0xA0) || keyDown(0xA1)
+	win := keyDown(0x5B) || keyDown(0x5C)
+	if (want&config.ModControl != 0) != ctrl {
+		return false
+	}
+	if (want&config.ModAlt != 0) != alt {
+		return false
+	}
+	if (want&config.ModShift != 0) != shift {
+		return false
+	}
+	if (want&config.ModWin != 0) != win {
+		return false
+	}
+	return true
 }
 
 // registerError renders the RegisterHotKey failure in Chinese, naming the key
@@ -337,11 +425,14 @@ func registerError(hk config.Hotkey, callErr error) error {
 	}
 }
 
-// doUnregister releases one name's hotkey.
+// doUnregister releases one name's hotkey and stops polling it.
 func (m *Manager) doUnregister(hwnd windows.Handle, name string) {
 	m.mu.Lock()
 	id, ok := m.ids[name]
 	delete(m.ids, name)
+	delete(m.polls, name)
+	delete(m.pollDown, name)
+	delete(m.lastFire, name)
 	m.mu.Unlock()
 	if ok {
 		procUnregisterHK.Call(uintptr(hwnd), uintptr(id))
@@ -356,6 +447,9 @@ func (m *Manager) doUnregisterAll(hwnd windows.Handle) {
 		ids = append(ids, id)
 	}
 	m.ids = make(map[string]int)
+	m.polls = make(map[string]pollBind)
+	m.pollDown = make(map[string]bool)
+	m.lastFire = make(map[string]time.Time)
 	m.mu.Unlock()
 	for _, id := range ids {
 		procUnregisterHK.Call(uintptr(hwnd), uintptr(id))

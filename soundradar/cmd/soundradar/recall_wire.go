@@ -199,7 +199,7 @@ func (r *recallRecorder) HotkeyStatus() string {
 		return "未启用（配置 recall.enabled=false）"
 	}
 	if r.registered {
-		return fmt.Sprintf("%s（RegisterHotKey 成功，回调 → 保存最近 %.1f 秒）", r.label, r.RingSeconds())
+		return fmt.Sprintf("%s（含游戏内轮询，保存最近 %.1f 秒）", r.label, r.RingSeconds())
 	}
 	if r.regErr != "" {
 		return fmt.Sprintf("%s 注册失败（%s）；仍可用管理端「立即保存」或 /api/recall/trigger", r.label, r.regErr)

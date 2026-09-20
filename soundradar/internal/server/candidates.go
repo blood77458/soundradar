@@ -225,15 +225,19 @@ func (s *Server) handleCandidates(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// recallHotkeyStatus parses the CLI's one-line hotkey description
-// ("F8（RegisterHotKey 成功，回调 → 保存最近 3.0 秒）") into (ok, spelling).
+// recallHotkeyStatus parses the CLI's one-line hotkey description into
+// (ok, spelling). A registered key mentions either RegisterHotKey success or
+// the in-game poller ("含游戏内轮询").
 func (s *Server) recallHotkeyStatus() (bool, string) {
 	sink := s.recallSink()
 	if sink == nil {
 		return false, s.currentConfig().Hotkeys.RecallLabel
 	}
 	status := sink.HotkeyStatus()
-	ok := strings.Contains(status, "成功")
+	ok := strings.Contains(status, "成功") || strings.Contains(status, "轮询") || strings.Contains(status, "回调")
+	if strings.Contains(status, "注册失败") || strings.Contains(status, "未启用") || strings.Contains(status, "未注册") {
+		ok = false
+	}
 	spec := status
 	if i := strings.IndexAny(spec, "（("); i > 0 {
 		spec = spec[:i]

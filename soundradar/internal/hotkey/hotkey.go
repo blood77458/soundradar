@@ -1,31 +1,37 @@
 // Package hotkey implements global (system-wide) hotkeys for soundradar.
 //
 // It exists for the P4 recall feature: the player presses one key while playing
-// and the last few seconds of audio are saved. Global hotkeys are official
-// Win32 RegisterHotKey registrations - this package NEVER synthesises or hooks
-// keyboard input (SendInput / keybd_event / SetWindowsHookEx are a ban risk
-// while a game with anti-cheat is running).
+// and the last few seconds of audio are saved.
+//
+// Two delivery paths run together:
+//
+//  1. RegisterHotKey + WM_HOTKEY — the official Win32 global hotkey. It works
+//     on the desktop, but many games swallow the key with Raw Input / DirectInput
+//     and the message never arrives while the game has focus.
+//  2. GetAsyncKeyState polling (~20 ms) — reads the hardware key state from this
+//     process only. It does NOT install SetWindowsHookEx, SendInput or
+//     keybd_event (those stay banned next to anti-cheat). This is what makes F8
+//     work inside a game that "owns" the keyboard.
+//
+// A short debounce merges the two paths so one physical press cannot fire twice.
 //
 // # Thread model
 //
 // RegisterHotKey binds a hotkey to the calling thread, and WM_HOTKEY is posted
 // to that thread's message queue. The manager therefore owns exactly one OS
 // thread for its whole life, and that same thread creates the window, calls
-// RegisterHotKey, and pumps GetMessageW. A second LockOSThread goroutine would
-// be a different OS thread: the key would register, then the press would be
-// delivered to a queue nobody reads.
+// RegisterHotKey, pumps GetMessageW, and runs the poll timer.
 //
 //	goroutine A (caller)                goroutine B (window thread, LockOSThread)
 //	--------------------                ------------------------------------------
-//	NewManager()  ───────────────────▶  RegisterClassExW + CreateWindowExW
+//	NewManager()  ───────────────────▶  RegisterClassExW + CreateWindowExW + SetTimer
 //	Register(cmd) ──cmdCh─────────────▶  GetMessageW (woken by PostMessageW)
-//	             ◀──reply chan─────────  RegisterHotKey(...)
-//	(key press)                         WM_HOTKEY → go callback()
-//	Close()       ──cmdCh(quit)────────▶ UnregisterHotKey, DestroyWindow, exit
+//	             ◀──reply chan─────────  RegisterHotKey(...) + arm poll
+//	(key press)                         WM_HOTKEY and/or WM_TIMER poll → go callback()
+//	Close()       ──cmdCh(quit)────────▶ UnregisterHotKey, KillTimer, DestroyWindow
 //
 // GetMessageW blocks, so commands wake it with PostMessageW instead of a
-// select. The WM_HOTKEY handler must not block: Manager calls every callback
-// as `go fn()`.
+// select. Callbacks must not block: Manager calls every one as `go fn()`.
 package hotkey
 
 import (
@@ -84,14 +90,29 @@ type Manager struct {
 	closed bool
 	regs   map[string]string // name -> canonical spec (successful registrations)
 	fns    map[string]func()
-	errs   map[string]string // name -> Chinese failure reason
+	errs   map[string]string // name -> Chinese failure reason (parse / hard fail)
 	defs   map[string]string // name -> asked-for spelling (even after a failure)
 	ids    map[string]int    // name -> Win32 hotkey id (message thread only)
-	nextID int               // message thread only
-	hwnd   uintptr
-	tid    uint32
-	lastEr string
+	// polls arms GetAsyncKeyState watching so a game that swallows WM_HOTKEY
+	// still delivers the key. Message thread writes; pollKeys reads under mu.
+	polls    map[string]pollBind
+	pollDown map[string]bool
+	lastFire map[string]time.Time
+	nextID   int // message thread only
+	hwnd     uintptr
+	tid      uint32
+	lastEr   string
 }
+
+// pollBind is one key watched by the GetAsyncKeyState fallback.
+type pollBind struct {
+	vk   uint32
+	mods uint32 // without ModNoRepeat
+}
+
+// fireDebounce is how long one physical press is considered the same event for
+// both WM_HOTKEY and the poller.
+const fireDebounce = 350 * time.Millisecond
 
 // NewManager creates the hidden window and starts its message loop. It returns
 // only after the window exists, so Register can be called immediately.
@@ -225,7 +246,7 @@ func (m *Manager) Describe() string {
 			parts = append(parts, fmt.Sprintf("%s=[失败] %s", n, reason))
 			continue
 		}
-		parts = append(parts, fmt.Sprintf("%s=[ok] %s", n, m.regs[n]))
+		parts = append(parts, fmt.Sprintf("%s=[ok] %s（含游戏内轮询）", n, m.regs[n]))
 	}
 	return strings.Join(parts, "  ")
 }
@@ -234,8 +255,10 @@ func (m *Manager) Describe() string {
 // accepts ("F8", "Ctrl+Alt+F8"); the value "none" (or an empty string) removes
 // the registration without reporting an error.
 //
-// The call is synchronous: it returns once the window thread has the real
-// RegisterHotKey result, so a caller can print "F8 已被其它程序占用" right away.
+// The call is synchronous. On Windows it always arms GetAsyncKeyState polling
+// so the key still works while a game swallows WM_HOTKEY. RegisterHotKey is
+// also attempted; a conflict there is soft (polling alone is enough) and does
+// not make Register return an error.
 func (m *Manager) Register(name, spec string, fn func()) error {
 	if m == nil {
 		return errors.New("热键管理器未初始化")
@@ -279,7 +302,12 @@ func (m *Manager) Register(name, spec string, fn func()) error {
 	}
 	m.mu.Lock()
 	m.regs[name] = canonical
-	m.ids[name] = rep.id
+	if rep.id != 0 {
+		m.ids[name] = rep.id
+	} else {
+		// RegisterHotKey soft-failed; GetAsyncKeyState polling is still armed.
+		delete(m.ids, name)
+	}
 	delete(m.errs, name)
 	m.lastEr = ""
 	m.mu.Unlock()
@@ -420,7 +448,7 @@ func (m *Manager) setFailure(name, spec, reason string) {
 }
 
 // handleHotkey runs on the message thread: it must not block, so the callback
-// gets its own goroutine.
+// gets its own goroutine. Debounces against the GetAsyncKeyState poller.
 func (m *Manager) handleHotkey(id int) {
 	m.mu.Lock()
 	name, fn := "", (func())(nil)
@@ -430,6 +458,15 @@ func (m *Manager) handleHotkey(id int) {
 			fn = m.fns[n]
 			break
 		}
+	}
+	if name != "" {
+		now := time.Now()
+		if last, ok := m.lastFire[name]; ok && now.Sub(last) < fireDebounce {
+			m.mu.Unlock()
+			return
+		}
+		m.lastFire[name] = now
+		m.pollDown[name] = true // suppress the rising-edge the poller would see
 	}
 	m.mu.Unlock()
 	if name == "" || fn == nil {

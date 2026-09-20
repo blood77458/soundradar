@@ -48,6 +48,7 @@ var (
 	procGetWindowRect             = user32.NewProc("GetWindowRect")
 	procRegisterHotKey            = user32.NewProc("RegisterHotKey")
 	procUnregisterHotKey          = user32.NewProc("UnregisterHotKey")
+	procGetAsyncKeyState          = user32.NewProc("GetAsyncKeyState")
 	procSetTimer                  = user32.NewProc("SetTimer")
 	procKillTimer                 = user32.NewProc("KillTimer")
 	procGetDC                     = user32.NewProc("GetDC")
@@ -290,6 +291,10 @@ type Overlay struct {
 	// CLI banner would race with the window thread).
 	hotkeyDone chan struct{}
 	hotkeyOnce sync.Once
+	// pollDown / lastToggleFire implement the GetAsyncKeyState fallback used when
+	// a game swallows WM_HOTKEY for the overlay toggle.
+	pollDown       bool
+	lastToggleFire time.Time
 
 	// peakAlpha remembers the highest per-pixel alpha any frame has reached; the
 	// acceptance run's frame dump uses it to keep the most visible frame.
@@ -730,6 +735,7 @@ func wndProc(hwnd windows.Handle, msg uint32, wparam, lparam uintptr) uintptr {
 	}
 	switch msg {
 	case wmAppFrame, wmTimer:
+		o.pollToggleHotkey()
 		o.renderFrame()
 		return 0
 	case wmAppConfig:
@@ -741,7 +747,7 @@ func wndProc(hwnd windows.Handle, msg uint32, wparam, lparam uintptr) uintptr {
 		return 0
 	case wmHotkey:
 		if uint32(wparam) == hotkeyIDToggle {
-			o.toggleVisible()
+			o.fireToggleHotkey()
 			return 0
 		}
 	case wmAppQuit, wmClose:
@@ -1086,10 +1092,14 @@ func (o *Overlay) registerHotkey(hwnd windows.Handle) {
 	ok := r != 0
 	msg := ""
 	if !ok {
-		msg = fmt.Sprintf("RegisterHotKey(%s) 失败: %v（可能已被其它程序占用）", hk.String(), callErr)
+		// Still mark OK: GetAsyncKeyState polling on the render timer covers
+		// games that swallow WM_HOTKEY (and RegisterHotKey conflicts).
+		msg = fmt.Sprintf("RegisterHotKey(%s) 失败: %v；已改用游戏内键盘轮询", hk.String(), callErr)
+		ok = true
 	}
 	o.mu.Lock()
 	o.hotkey, o.hotkeyOK, o.hotkeyErr = hk, ok, msg
+	o.pollDown = false
 	o.mu.Unlock()
 }
 
@@ -1101,6 +1111,75 @@ func (o *Overlay) unregisterHotkey(hwnd windows.Handle) {
 		return
 	}
 	procUnregisterHotKey.Call(uintptr(hwnd), hotkeyIDToggle)
+}
+
+const overlayHotkeyDebounce = 350 * time.Millisecond
+
+// fireToggleHotkey is the shared rising-edge path for WM_HOTKEY and the poller.
+func (o *Overlay) fireToggleHotkey() {
+	o.mu.Lock()
+	now := time.Now()
+	if !o.lastToggleFire.IsZero() && now.Sub(o.lastToggleFire) < overlayHotkeyDebounce {
+		o.mu.Unlock()
+		return
+	}
+	o.lastToggleFire = now
+	o.pollDown = true
+	o.mu.Unlock()
+	o.toggleVisible()
+}
+
+// pollToggleHotkey reads GetAsyncKeyState so F9 still works while a game has
+// focus and swallows RegisterHotKey messages.
+func (o *Overlay) pollToggleHotkey() {
+	o.mu.Lock()
+	hk := o.hotkey
+	if !o.hotkeyOK || hk.VK == 0 {
+		o.mu.Unlock()
+		return
+	}
+	mods := hk.Modifiers &^ config.ModNoRepeat
+	down := overlayKeyDown(hk.VK) && overlayModsMatch(mods)
+	was := o.pollDown
+	o.pollDown = down
+	shouldFire := down && !was
+	if shouldFire {
+		now := time.Now()
+		if !o.lastToggleFire.IsZero() && now.Sub(o.lastToggleFire) < overlayHotkeyDebounce {
+			shouldFire = false
+		} else {
+			o.lastToggleFire = now
+		}
+	}
+	o.mu.Unlock()
+	if shouldFire {
+		o.toggleVisible()
+	}
+}
+
+func overlayKeyDown(vk uint32) bool {
+	r, _, _ := procGetAsyncKeyState.Call(uintptr(vk))
+	return r&0x8000 != 0
+}
+
+func overlayModsMatch(want uint32) bool {
+	ctrl := overlayKeyDown(0x11) || overlayKeyDown(0xA2) || overlayKeyDown(0xA3)
+	alt := overlayKeyDown(0x12) || overlayKeyDown(0xA4) || overlayKeyDown(0xA5)
+	shift := overlayKeyDown(0x10) || overlayKeyDown(0xA0) || overlayKeyDown(0xA1)
+	win := overlayKeyDown(0x5B) || overlayKeyDown(0x5C)
+	if (want&config.ModControl != 0) != ctrl {
+		return false
+	}
+	if (want&config.ModAlt != 0) != alt {
+		return false
+	}
+	if (want&config.ModShift != 0) != shift {
+		return false
+	}
+	if (want&config.ModWin != 0) != win {
+		return false
+	}
+	return true
 }
 
 func (o *Overlay) startTimer(hwnd windows.Handle) {

@@ -148,10 +148,10 @@ func TestRegisterRejectsBadSpecWithChineseError(t *testing.T) {
 	}
 }
 
-// TestSecondManagerOnSameKeyFailsLoudly pins the "已被其它程序占用" path: the
-// same key cannot be registered twice system-wide, and the second attempt has to
-// say so in Chinese.
-func TestSecondManagerOnSameKeyFailsLoudly(t *testing.T) {
+// TestSecondManagerStillPollsWhenRegisterHotKeyConflicts pins the in-game
+// path: a second process may lose RegisterHotKey (error 1409), but GetAsyncKeyState
+// polling must still arm so F8 works while a game owns the keyboard.
+func TestSecondManagerStillPollsWhenRegisterHotKeyConflicts(t *testing.T) {
 	m1, err := NewManager()
 	if err != nil {
 		t.Skipf("本环境没有消息窗口: %v", err)
@@ -166,20 +166,19 @@ func TestSecondManagerOnSameKeyFailsLoudly(t *testing.T) {
 		t.Fatalf("NewManager#2: %v", err)
 	}
 	defer m2.Close()
-	err = m2.Register("recall", "F8", func() {})
-	if err == nil {
-		// Some Windows configurations deliver the key to the first window
-		// instead of failing; report that instead of pretending.
-		t.Logf("第二个管理器也注册成功了（Windows 未报 1409 冲突）")
-		return
+	if err := m2.Register("recall", "F8", func() {}); err != nil {
+		t.Fatalf("第二个管理器应靠轮询继续可用，不应硬失败: %v", err)
 	}
-	if !strings.Contains(err.Error(), "F8") || !hasHan(err.Error()) {
-		t.Fatalf("冲突原因应该是中文且带按键名: %v", err)
+	if !m2.OK("recall") {
+		t.Fatalf("第二个管理器 OK() 应为真（轮询已武装）")
 	}
-	t.Logf("第二个管理器的注册结果（真实输出）：%v", err)
-	if m2.OK("recall") {
-		t.Fatalf("注册失败时 OK() 必须为假")
+	m2.mu.Lock()
+	_, armed := m2.polls["recall"]
+	m2.mu.Unlock()
+	if !armed {
+		t.Fatal("第二个管理器没有武装 GetAsyncKeyState 轮询")
 	}
+	t.Logf("第二个管理器 Describe: %s", m2.Describe())
 }
 
 // TestManagerClosesCleanly pins that Close releases the window and is

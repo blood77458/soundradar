@@ -122,7 +122,7 @@ func (f *fakeRecall) Dir() string                        { return f.dir }
 func (f *fakeRecall) RingSeconds() float64               { return 3 }
 func (f *fakeRecall) CoverSeconds() float64              { return f.rec.Seconds() }
 func (f *fakeRecall) HotkeyStatus() string {
-	return "F8（RegisterHotKey 成功，回调 → 保存最近 3.0 秒）"
+	return "F8（含游戏内轮询，保存最近 3.0 秒）"
 }
 func (f *fakeRecall) MaxFiles() int { return f.store.MaxFiles() }
 func (f *fakeRecall) EnsureCapture() error {
