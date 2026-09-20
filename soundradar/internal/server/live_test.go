@@ -302,9 +302,14 @@ wait:
 		t.Fatalf("只收到 %d 条 tick（需要 >= 5）", len(ticks))
 	}
 	if len(events) < 1 {
-		t.Fatalf("没有收到 event 消息（tick %d 条）", len(ticks))
+		best := 0.0
+		for _, tk := range ticks {
+			if len(tk.Top) > 0 && tk.Top[0].Score > best {
+				best = tk.Top[0].Score
+			}
+		}
+		t.Fatalf("没有收到 event 消息（tick %d 条，最高分 %.4f）", len(ticks), best)
 	}
-
 	first := ticks[0]
 	t.Logf("hello: %v", hello)
 	t.Logf("收到 tick %d 条 / event %d 条", len(ticks), len(events))

@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/znz/soundradar/internal/config"
-	"github.com/znz/soundradar/internal/dsp"
 	"github.com/znz/soundradar/internal/index"
 	"github.com/znz/soundradar/internal/library"
 	"github.com/znz/soundradar/internal/live"
@@ -59,7 +58,8 @@ const overlayUsage = `soundradar overlay - 命中时弹出原生悬浮窗（图�
   窗口样式固定为 WS_POPUP + WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_TOPMOST|
   WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW：逐像素透明、鼠标穿透、置顶、不抢焦点、
   不出现在任务栏/Alt-Tab。热键（默认 F9）用官方 RegisterHotKey 注册，工具本身
-  绝不模拟或钩取键盘。`
+  绝不模拟或钩取键盘。
+`
 
 // overlaySelfCheck is the machine-readable state printed by --selfcheck.
 type overlaySelfCheck struct {
@@ -166,7 +166,7 @@ func runOverlay(args []string) error {
 	if err != nil {
 		return fmt.Errorf("索引路径无效: %w", err)
 	}
-	params := dsp.DefaultParams()
+	params := dspParamsFor(cfg.Noise)
 	ix, rebuilt, why, err := index.LoadOrBuild(lib, idx, params)
 	if err != nil {
 		return fmt.Errorf("准备索引失败: %w", err)
@@ -212,16 +212,19 @@ func runOverlay(args []string) error {
 		src, err = live.NewCaptureSource(cfg.Capture.Device)
 		if err != nil {
 			if !cfg.Capture.FallbackToDefault || cfg.Capture.Device == "" {
+				reportCaptureFailure(os.Stderr, err)
 				return fmt.Errorf("打开采集端点失败: %w", err)
 			}
 			fmt.Fprintf(os.Stderr, "[overlay] 端点 %q 打不开（%v），回退到系统默认端点\n", cfg.Capture.Device, err)
 			src, err = live.NewCaptureSource("")
 			if err != nil {
+				reportCaptureFailure(os.Stderr, err)
 				return fmt.Errorf("打开默认采集端点失败: %w", err)
 			}
 		}
 	}
 	defer src.Stop()
+	printSourceNote("[overlay] ", src, *quiet)
 
 	// ---- recognition link ------------------------------------------------
 	csvSink, err := newHitCSV(*csvPath)
@@ -242,7 +245,11 @@ func runOverlay(args []string) error {
 			rec.Store().Dir(), rec.RingSeconds(), rec.Store().MaxFiles())
 	}
 
-	opts := live.Options{TopN: 5, SilenceDBFS: match.DefaultOptions().SilenceDBFS}
+	opts := live.Options{
+		TopN:         5,
+		SilenceDBFS:  match.DefaultOptions().SilenceDBFS,
+		AdaptiveGate: params.EffectiveNoise().AdaptiveGate,
+	}
 	if rec.Enabled() {
 		// The ring is filled from the same blocks the analyzer sees.
 		opts.OnBlock = rec.Buffer
@@ -363,7 +370,7 @@ func printOverlayBanner(cfg *config.Config, info config.PathInfo, lib, idx strin
 func formatMonitorReport(ov *overlay.Overlay) string {
 	st := ov.State()
 	var sb strings.Builder
-	sb.WriteString("[overlay] 显示器（物理像素）:\n")
+	sb.WriteString("[overlay] 显示器（物理像素）：\n")
 	for _, m := range st.Monitors {
 		fx, fy, fw, fh := m.FullRect()
 		wx, wy, ww, wh := m.WorkRect()

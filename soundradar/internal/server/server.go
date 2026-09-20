@@ -28,6 +28,7 @@ import (
 
 	"github.com/znz/soundradar/internal/audio"
 	"github.com/znz/soundradar/internal/config"
+	"github.com/znz/soundradar/internal/dsp"
 	"github.com/znz/soundradar/internal/library"
 	"github.com/znz/soundradar/internal/recall"
 )
@@ -88,6 +89,13 @@ type Options struct {
 	// `serve` run wants; `serve --config <file>` sets it so the settings page
 	// edits the very file the user named instead of the default one.
 	ConfigPath string
+
+	// Params is the fingerprint configuration used to build or rebuild the index
+	// and to drive the live link. It carries the environment-noise settings from
+	// config.json, which are part of the fingerprint: with them installed the
+	// server rebuilds the index instead of searching vectors produced by a
+	// different pipeline. The zero value means dsp.DefaultParams().
+	Params dsp.Params
 }
 
 // Server is the management API server.
@@ -119,6 +127,9 @@ type Server struct {
 
 	// configPath, when set, is the exact file PATCH /api/config writes.
 	configPath string
+
+	// params is the fingerprint configuration (Options.Params, defaulted).
+	params dsp.Params
 }
 
 // New creates a Server.
@@ -131,6 +142,17 @@ func New(o Options) *Server {
 	if bind == "" {
 		bind = "127.0.0.1"
 	}
+	params := o.Params
+	if err := params.Validate(); err != nil {
+		// A caller that passed nothing gets the defaults; a caller that passed
+		// something unusable is a programming error, and silently falling back
+		// would search an index built by a different pipeline.
+		if params == (dsp.Params{}) {
+			params = dsp.DefaultParams()
+		} else {
+			panic("server: 无效的特征参数: " + err.Error())
+		}
+	}
 	s := &Server{
 		store:         o.Store,
 		logger:        lg,
@@ -139,6 +161,7 @@ func New(o Options) *Server {
 		overlay:       o.Overlay,
 		cfg:           o.Config,
 		configPath:    o.ConfigPath,
+		params:        params,
 	}
 	s.live = newLiveHub(s)
 	s.http = &http.Server{

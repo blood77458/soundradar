@@ -162,6 +162,26 @@ func (e *Engine) SetMinMargin(v float64) {
 	e.opts.MinMargin = v
 }
 
+// SetSilenceDBFS changes the silence gate at runtime. The realtime link uses it
+// to follow the measured noise floor (see live.Options.AdaptiveGate), so a noisy
+// game stops scoring empty windows without the user having to edit config.json.
+// A non-finite value is ignored: the gate must stay comparable.
+func (e *Engine) SetSilenceDBFS(v float64) {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.opts.SilenceDBFS = v
+}
+
+// SilenceDBFS returns the silence gate currently in force.
+func (e *Engine) SilenceDBFS() float64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.opts.SilenceDBFS
+}
+
 // Stats reports how many ticks were seen and how the gates filtered them.
 func (e *Engine) Stats() (ticks, fired, skippedSilent, rejected int64) {
 	e.mu.Lock()

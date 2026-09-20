@@ -5,6 +5,7 @@ package capture
 import (
 	"errors"
 	"fmt"
+	"os"
 	"runtime"
 	"time"
 	"unsafe"
@@ -245,6 +246,13 @@ func friendlyName(mmd *wca.IMMDevice) string {
 // ---------------------------------------------------------------------------
 
 // Capture records the speaker loopback of one render endpoint for d.
+//
+// Endpoint selection is forgiving on purpose: it first tries the endpoint the
+// caller named (or the default one), and if that endpoint refuses shared-mode
+// loopback it walks the other active endpoints before giving up. See
+// candidateDevices for why that matters (audio enhancements, spatial sound,
+// exclusive mode and Bluetooth hands-free mode all make a specific endpoint
+// unusable, and the machine usually has a second one that works).
 func (c *loopbackCapturer) Capture(deviceSubstr string, d time.Duration) (*Result, error) {
 	if d <= 0 {
 		return nil, fmt.Errorf("capture: duration must be positive, got %s", d)
@@ -253,91 +261,29 @@ func (c *loopbackCapturer) Capture(deviceSubstr string, d time.Duration) (*Resul
 		return nil, errors.New("capture: device enumerator is not initialised")
 	}
 
-	devices, err := c.Enumerate()
+	sess, skipped, err := c.openFirstEndpoint(deviceSubstr)
 	if err != nil {
 		return nil, err
 	}
-	dev, err := MatchDevice(devices, deviceSubstr)
-	if err != nil {
-		return nil, err
+	defer sess.release()
+
+	dev, iac, acc, mix, bytesPerFrame := sess.dev, sess.iac, sess.acc, sess.mix, sess.bytesPer
+	if note := sess.note(skipped); note != "" {
+		fmt.Fprintf(os.Stderr, "[capture] 注意：%s", note)
 	}
 
-	// --- activate IAudioClient on the chosen endpoint -----------------------
-	// go-wca v0.3.0 leaves IMMDeviceEnumerator::GetDevice (lookup by endpoint
-	// ID) unimplemented, so the endpoint is re-fetched by enumeration index.
-	mmd, err := c.deviceByIndex(dev.Index)
-	if err != nil {
-		return nil, err
-	}
-	defer mmd.Release()
-
-	var iac *wca.IAudioClient
-	// NOTE: go-wca's Activate() takes (refIID, ctx, param, obj) but the wrapper
-	// hard-codes the 4th COM argument (pActivationParams) to NULL, so `param`
-	// is ignored and must be passed as nil.
-	if err := mmd.Activate(wca.IID_IAudioClient, wca.CLSCTX_ALL, nil, &iac); err != nil {
-		return nil, fmt.Errorf("IMMDevice::Activate(IAudioClient) failed: %w", err)
-	}
-	defer iac.Release()
-
-	// --- mix format ---------------------------------------------------------
-	var wfx *wca.WAVEFORMATEX
-	if err := iac.GetMixFormat(&wfx); err != nil {
-		return nil, fmt.Errorf("IAudioClient::GetMixFormat failed: %w", err)
-	}
-	// The mix format is CoTaskMemAlloc'ed by the audio engine.
-	defer ole.CoTaskMemFree(uintptr(unsafe.Pointer(wfx)))
-
-	mix, err := mixFormat(wfx)
-	if err != nil {
-		return nil, err
-	}
-	if !supportedMixFormat(mix) {
-		return nil, fmt.Errorf("capture: unsupported mix format %s", mix)
-	}
-	bytesPerFrame := int(wfx.NBlockAlign)
-	if bytesPerFrame <= 0 {
-		bytesPerFrame = mix.Channels * ((mix.BitsPerSample + 7) / 8)
-	}
-
-	// --- shared mode + loopback --------------------------------------------
-	if err := iac.Initialize(
-		wca.AUDCLNT_SHAREMODE_SHARED,
-		wca.AUDCLNT_STREAMFLAGS_LOOPBACK,
-		bufferDuration,
-		0, // shared mode requires periodicity == 0
-		wfx,
-		nil,
-	); err != nil {
-		return nil, fmt.Errorf("IAudioClient::Initialize(shared/loopback) failed: %w", err)
-	}
-
-	var bufferFrameCount uint32
-	if err := iac.GetBufferSize(&bufferFrameCount); err != nil {
-		return nil, fmt.Errorf("IAudioClient::GetBufferSize failed: %w", err)
-	}
-
-	var acc *wca.IAudioCaptureClient
-	if err := iac.GetService(wca.IID_IAudioCaptureClient, &acc); err != nil {
-		return nil, fmt.Errorf("IAudioClient::GetService(IAudioCaptureClient) failed: %w", err)
-	}
-	defer acc.Release()
-
-	// --- capture loop ------------------------------------------------------
-	targetFrames := int64(d.Seconds() * float64(mix.SampleRate))
 	res := &Result{
-		Device:     dev,
-		MixFormat:  mix,
-		Channels:   mix.Channels,
+		Device:    dev,
+		MixFormat: mix,
+		Channels:  mix.Channels,
 		SampleRate: mix.SampleRate,
-		PCM:        make([]int16, 0, targetFrames*int64(mix.Channels)),
 	}
 
 	// Nothing is delivered before Start(); loopback in shared mode keeps
 	// delivering (silent) packets while nothing is playing, which is exactly
 	// what we want for a stable timeline.
 	if err := iac.Start(); err != nil {
-		return nil, fmt.Errorf("IAudioClient::Start failed: %w", err)
+		return res, fmt.Errorf("IAudioClient::Start failed: %s", explainInitializeError(err, mix.String()))
 	}
 	stopped := false
 	stop := func() {
@@ -347,6 +293,9 @@ func (c *loopbackCapturer) Capture(deviceSubstr string, d time.Duration) (*Resul
 		}
 	}
 	defer stop()
+
+	targetFrames := int64(d.Seconds() * float64(mix.SampleRate))
+	res.PCM = make([]int16, 0, targetFrames*int64(mix.Channels))
 
 	wallStart := time.Now()
 	// Safety net: never spin forever if the endpoint stalls.
@@ -532,14 +481,20 @@ func mixFormat(wfx *wca.WAVEFORMATEX) (SampleFormat, error) {
 }
 
 // supportedMixFormat reports whether appendPacket can convert the format.
+//
+// The accepted set is deliberately wide: every integer width from 8 to 32 bits
+// (including the unusual 20/28-bit packed formats some DSPs report) and 32/64-bit
+// float. Refusing a format is a hard failure - the endpoint cannot be captured at
+// all - so the only formats turned away are ones that cannot describe audio.
 func supportedMixFormat(f SampleFormat) bool {
 	switch {
-	case f.Float && (f.BitsPerSample == 32 || f.BitsPerSample == 64):
-		return true
-	case !f.Float && (f.BitsPerSample == 8 || f.BitsPerSample == 16 || f.BitsPerSample == 24 || f.BitsPerSample == 32):
-		return true
+	case f.SampleRate <= 0 || f.Channels <= 0:
+		return false
+	case f.Float:
+		return f.BitsPerSample == 32 || f.BitsPerSample == 64
+	default:
+		return f.BitsPerSample >= 8 && f.BitsPerSample <= 32
 	}
-	return false
 }
 
 // ---------------------------------------------------------------------------
@@ -590,6 +545,29 @@ func appendPacket(dst []int16, data *byte, n, frames, bytesPerFrame int, f Sampl
 		raw := unsafe.Slice(data, n)
 		for _, b := range raw {
 			dst = append(dst, int16(int(b)-128)<<8)
+		}
+	case !f.Float && f.BitsPerSample > 8 && f.BitsPerSample < 32:
+		// The remaining integer widths: the packed 20-bit and 28-bit formats a
+		// few DSPs report, plus anything else below 32. Each sample is read
+		// little-endian out of its container, shifted so its most significant
+		// bit lands at bit 31 (i.e. sign-extended and scaled to full range) and
+		// then reduced to 16 bits. Reading it generically means such an endpoint
+		// is captured instead of being refused outright.
+		width := (f.BitsPerSample + 7) / 8
+		raw := unsafe.Slice(data, frames*bytesPerFrame)
+		for i := 0; i < n; i++ {
+			base := i * width
+			var u uint32
+			for k := width - 1; k >= 0; k-- {
+				u = u<<8 | uint32(raw[base+k])
+			}
+			u <<= uint(32 - f.BitsPerSample)
+			dst = append(dst, int16(int32(u)>>16))
+		}
+	case !f.Float && f.BitsPerSample == 32:
+		src := unsafe.Slice((*int32)(unsafe.Pointer(data)), n)
+		for _, v := range src {
+			dst = append(dst, int16(v>>16))
 		}
 	}
 	return dst

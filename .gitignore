@@ -13,8 +13,12 @@ soundradar/artifacts/
 # F8 candidates are temporary inbox clips, not the published library.
 soundradar/bin/
 soundradar/data/candidates/
+# config.json is generated next to the exe (or, during `go run`, next to the
+# package): it names the local playback device and overlay position.
+soundradar/cmd/soundradar/config.json
 *.exe
 *.bak
+*.syso
 
 # Local migration kit. It packs chat sessions and login credentials.
 迁移打包.ps1

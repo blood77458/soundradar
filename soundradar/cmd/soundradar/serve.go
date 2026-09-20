@@ -24,7 +24,21 @@ import (
 	"github.com/znz/soundradar/internal/overlay"
 	"github.com/znz/soundradar/internal/recall"
 	"github.com/znz/soundradar/internal/server"
+	"github.com/znz/soundradar/internal/tray"
 )
+
+// serveExit is signalled by the tray icon's "quit" entry so that a tray quit runs
+// exactly the same graceful shutdown as Ctrl+C.
+var (
+	serveExitOnce sync.Once
+	serveExit     = make(chan struct{})
+)
+
+// requestServeExit asks a running `serve` process to shut down. It is safe to
+// call more than once.
+func requestServeExit() {
+	serveExitOnce.Do(func() { close(serveExit) })
+}
 
 // runServe implements the P1 `soundradar serve` subcommand: it opens (or
 // creates) the sound-effect library and exposes the management API + embedded
@@ -37,6 +51,7 @@ func runServe(args []string) error {
 	strictPort := fs.Bool("strict-port", false, "fail instead of trying port+1 when the port is taken")
 	quiet := fs.Bool("quiet", false, "suppress the startup banner")
 	withOverlay := fs.Bool("overlay", false, "also create the native hit overlay window (P3)")
+	withTray := fs.Bool("tray", false, "also put a soundradar icon in the notification area")
 	cfgPath := fs.String("config", "", "settings file (default <exe dir>/config.json)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -79,13 +94,19 @@ func runServe(args []string) error {
 		return fmt.Errorf("库文件路径无效 %q: %w", path, err)
 	}
 
+	// The environment-noise settings are part of the fingerprint, so the index
+	// and the live link are both built from this one value.
+	params := dspParamsFor(cfg.Noise)
+
 	store, err := library.Open(path)
 	if err != nil {
 		return fmt.Errorf("打开音效库失败: %w", err)
 	}
 
 	logger := log.New(os.Stderr, "", log.LstdFlags)
-	srv := server.New(server.Options{Store: store, Logger: logger, Config: cfg, ConfigPath: cfgFile})
+	srv := server.New(server.Options{
+		Store: store, Logger: logger, Config: cfg, ConfigPath: cfgFile, Params: params,
+	})
 
 	// ---- optional overlay window (P3) ------------------------------------
 	var ov *overlay.Overlay
@@ -138,6 +159,7 @@ func runServe(args []string) error {
 			c, err := startCaptureRecorder(context.Background(), cfg.Capture.Device, rec, ix)
 			if err != nil {
 				logger.Printf("[serve] 回溯采集未能启动（%v）；候选项收件箱仍可用，但需要实时识别正在采音才能保存新片段", err)
+				reportCaptureFailure(os.Stderr, err)
 				return
 			}
 			cap = c
@@ -252,6 +274,35 @@ func runServe(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// ---- optional notification-area icon --------------------------------
+	// It is created last (so a failure cannot take the server down) and its
+	// "quit" entry stops this process the same way Ctrl+C does.
+	var trayIcon *tray.Tray
+	if *withTray {
+		panelURL := url
+		trayIcon, err = newServeTray(trayOptions{
+			PanelURL:     panelURL,
+			DataDir:      filepath.Dir(cfgFile),
+			CandidatesDir: func() string {
+				if d, derr := config.ResolveRecallDir(cfg.Recall.Dir); derr == nil {
+					return d
+				}
+				return ""
+			}(),
+			OverlayKey: cfg.Hotkeys.ToggleOverlay,
+			Overlay:    ov,
+			HasOverlay: ov != nil,
+		})
+		if err != nil {
+			// A tray icon that cannot be created is not fatal: the server is
+			// already listening and usable.
+			logger.Printf("[serve] 托盘图标未能创建：%v", err)
+		} else {
+			defer trayIcon.Close()
+			fmt.Printf("[serve] 托盘图标   : 已创建（左键打开管理界面，右键菜单，含退出）\n")
+		}
+	}
+
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Serve(ln) }()
 
@@ -262,16 +313,18 @@ func runServe(args []string) error {
 		}
 		return nil
 	case <-ctx.Done():
-		stop()
-		fmt.Printf("\n[serve] 收到退出信号，正在关闭…\n")
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := srv.Shutdown(shutCtx); err != nil {
-			return fmt.Errorf("关闭 HTTP 服务失败: %w", err)
-		}
-		fmt.Printf("[serve] 已停止，库文件未受影响: %s\n", path)
-		return nil
+	case <-serveExit:
 	}
+
+	stop()
+	fmt.Printf("\n[serve] 收到退出信号，正在关闭…\n")
+	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutCtx); err != nil {
+		return fmt.Errorf("关闭 HTTP 服务失败: %w", err)
+	}
+	fmt.Printf("[serve] 已停止，库文件未受影响: %s\n", path)
+	return nil
 }
 
 func itemPrefix(id string) string {

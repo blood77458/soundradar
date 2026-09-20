@@ -8,7 +8,6 @@ import (
 	"io"
 	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"github.com/go-ole/go-ole"
 	"github.com/moutend/go-wca/pkg/wca"
@@ -46,14 +45,14 @@ func OpenStream(deviceSubstr string) (*Stream, error) {
 		}
 		defer c.Close()
 
-		h, err := openLoopback(c, deviceSubstr)
+		h, note, skipped, err := openLoopback(c, deviceSubstr)
 		if err != nil {
 			ready <- streamHandshake{err: err}
 			return
 		}
 		defer h.releaseCOM()
 
-		ready <- streamHandshake{dev: h.dev, format: h.mix}
+		ready <- streamHandshake{dev: h.dev, format: h.mix, note: note, skipped: skipped}
 
 		if err := h.iac.Start(); err != nil {
 			h.fail(fmt.Errorf("IAudioClient::Start failed: %w", err))
@@ -124,6 +123,8 @@ func OpenStream(deviceSubstr string) (*Stream, error) {
 	return &Stream{
 		Device:     hs.dev,
 		Format:     hs.format,
+		Note:       hs.note,
+		Skipped:    hs.skipped,
 		queueDepth: streamQueueBlocks,
 		drops:      &drops,
 		silent:     &silent,
@@ -163,7 +164,13 @@ func sleepOrQuit(quit <-chan struct{}, d time.Duration) bool {
 type streamHandshake struct {
 	dev    Device
 	format SampleFormat
-	err    error
+	// note explains a non-obvious setup: a skipped endpoint, or a format other
+	// than the endpoint's own that had to be negotiated. It is never empty when
+	// something was substituted, so the substitution cannot go unnoticed.
+	note string
+	// skipped lists the endpoints that were tried and refused before dev.
+	skipped []EndpointFailure
+	err     error
 }
 
 // loopback is one opened IAudioClient/IAudioCaptureClient pair plus the state
@@ -205,67 +212,36 @@ func (h *loopback) fail(err error) {
 
 // openLoopback resolves the endpoint and initialises a shared-mode loopback
 // IAudioClient on it. It is the setup half that Capturer.Capture and Stream
-// share.
-func openLoopback(c *loopbackCapturer, deviceSubstr string) (*loopback, error) {
-	devices, err := c.Enumerate()
+// share, including the endpoint fallback (see candidateDevices) and the
+// alternate-format retry (see openEndpoint).
+func openLoopback(c *loopbackCapturer, deviceSubstr string) (*loopback, string, []EndpointFailure, error) {
+	sess, skipped, err := c.openFirstEndpoint(deviceSubstr)
 	if err != nil {
-		return nil, err
+		return nil, "", nil, err
 	}
-	dev, err := MatchDevice(devices, deviceSubstr)
-	if err != nil {
-		return nil, err
+	h := &loopback{
+		dev:      sess.dev,
+		iac:      sess.iac,
+		acc:      sess.acc,
+		mix:      sess.mix,
+		bytesPer: sess.bytesPer,
 	}
+	// The session's objects now belong to the loopback, which releases them.
+	sess.iac, sess.acc = nil, nil
+	sess.wfx = nil
+	return h, sess.note(skipped), endpointFailures(skipped), nil
+}
 
-	mmd, err := c.deviceByIndex(dev.Index)
-	if err != nil {
-		return nil, err
+// endpointFailures converts the internal skip list into the public report type.
+func endpointFailures(skipped []skippedEndpoint) []EndpointFailure {
+	if len(skipped) == 0 {
+		return nil
 	}
-	defer mmd.Release()
-
-	h := &loopback{dev: dev}
-
-	if err := mmd.Activate(wca.IID_IAudioClient, wca.CLSCTX_ALL, nil, &h.iac); err != nil {
-		return nil, fmt.Errorf("IMMDevice::Activate(IAudioClient) failed: %w", err)
+	out := make([]EndpointFailure, 0, len(skipped))
+	for _, sk := range skipped {
+		out = append(out, EndpointFailure{Device: sk.dev, Reason: firstLine(sk.err.Error())})
 	}
-
-	var wfx *wca.WAVEFORMATEX
-	if err := h.iac.GetMixFormat(&wfx); err != nil {
-		h.releaseCOM()
-		return nil, fmt.Errorf("IAudioClient::GetMixFormat failed: %w", err)
-	}
-	defer ole.CoTaskMemFree(uintptr(unsafe.Pointer(wfx)))
-
-	mix, err := mixFormat(wfx)
-	if err != nil {
-		h.releaseCOM()
-		return nil, err
-	}
-	if !supportedMixFormat(mix) {
-		h.releaseCOM()
-		return nil, fmt.Errorf("capture: unsupported mix format %s", mix)
-	}
-	h.mix = mix
-	h.bytesPer = int(wfx.NBlockAlign)
-	if h.bytesPer <= 0 {
-		h.bytesPer = mix.Channels * ((mix.BitsPerSample + 7) / 8)
-	}
-
-	if err := h.iac.Initialize(
-		wca.AUDCLNT_SHAREMODE_SHARED,
-		wca.AUDCLNT_STREAMFLAGS_LOOPBACK,
-		bufferDuration,
-		0,
-		wfx,
-		nil,
-	); err != nil {
-		h.releaseCOM()
-		return nil, fmt.Errorf("IAudioClient::Initialize(shared/loopback) failed: %w", err)
-	}
-	if err := h.iac.GetService(wca.IID_IAudioCaptureClient, &h.acc); err != nil {
-		h.releaseCOM()
-		return nil, fmt.Errorf("IAudioClient::GetService(IAudioCaptureClient) failed: %w", err)
-	}
-	return h, nil
+	return out
 }
 
 // packet converts the next queued WASAPI packet into a freshly allocated block

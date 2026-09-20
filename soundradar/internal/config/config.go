@@ -126,12 +126,55 @@ type RecallConfig struct {
 	MaxFiles int `json:"maxFiles"`
 }
 
+// NoiseConfig is the environment-noise filter used by the recognition pipeline.
+//
+// It exists because the same sound heard through game ambience does not look
+// like the same sound recorded in a quiet moment: the ambience lifts the quiet
+// mel bands and the cosine score drops. The filter measures the stationary
+// ambience of the last ~256 ms, attenuates every frequency bin by its own
+// signal-to-noise ratio, and can raise the silence gate above the measured
+// noise floor.
+//
+// These values are part of the FINGERPRINT (see internal/dsp): changing any of
+// them changes every stored vector, so the index is rebuilt automatically the
+// next time recognition starts. That is why they live in config.json rather
+// than being fixed constants.
+//
+// A zero value means "use the recommended default", so an existing config.json
+// without a "noise" section keeps working.
+type NoiseConfig struct {
+	// Method is "subtract" (high-pass + spectral gain, the default),
+	// "highpass" (only the high-pass, cheapest) or "off".
+	Method string `json:"method"`
+	// HighPassHz is the high-pass corner. It removes rumble and wind, which
+	// live below the lowest mel band anyway. Default 120.
+	HighPassHz float64 `json:"highPassHz"`
+	// Strength is the over-subtraction factor: how much of the estimated noise
+	// power is assumed to be noise. Larger means stronger suppression and a
+	// slightly more altered sound. Default 2.0.
+	Strength float64 `json:"strength"`
+	// GainFloorDB bounds how far a single frequency bin may be attenuated
+	// (default -14 dB).
+	GainFloorDB float64 `json:"gainFloorDb"`
+	// AdaptiveGate raises the silence gate above the measured noise floor, so a
+	// noisy game stops scoring empty windows. The zero value means "use the
+	// default", which is on: it is omitted from the file rather than written as
+	// false, and an explicit false switches it off.
+	AdaptiveGate bool `json:"adaptiveGate,omitempty"`
+	// GateMarginDB is how far above the noise floor that gate sits. Default 6.
+	GateMarginDB float64 `json:"gateMarginDb"`
+	// GateFloorDBFS is the lowest value the adaptive gate may take, so a quiet
+	// environment keeps the configured gate. Default -70.
+	GateFloorDBFS float64 `json:"gateFloorDbfs"`
+}
+
 // Config is the whole document.
 type Config struct {
 	Capture CaptureConfig `json:"capture"`
 	Overlay OverlayConfig `json:"overlay"`
 	Hotkeys HotkeyConfig  `json:"hotkeys"`
 	Recall  RecallConfig  `json:"recall"`
+	Noise   NoiseConfig   `json:"noise"`
 	Profile string        `json:"profile"`
 }
 
@@ -163,7 +206,22 @@ func Default() *Config {
 			Dir:      filepath.Join("data", "candidates"),
 			MaxFiles: 200,
 		},
+		Noise:   DefaultNoiseConfig(),
 		Profile: "default",
+	}
+}
+
+// DefaultNoiseConfig returns the recommended environment-noise settings. It
+// mirrors dsp.DefaultNoiseParams; the tests keep the two in step.
+func DefaultNoiseConfig() NoiseConfig {
+	return NoiseConfig{
+		Method:        "subtract",
+		HighPassHz:    120,
+		Strength:      2.0,
+		GainFloorDB:   -14,
+		AdaptiveGate:  true,
+		GateMarginDB:  6,
+		GateFloorDBFS: -70,
 	}
 }
 
@@ -542,7 +600,119 @@ func normalize(c *Config) {
 	if strings.TrimSpace(c.Recall.Dir) == "" {
 		c.Recall.Dir = filepath.Join("data", "candidates")
 	}
+	// Noise: an absent section or an empty method means "recommended default",
+	// so a config.json written before this feature keeps working.
+	c.Noise = normalizedNoise(c.Noise)
 }
+
+// NoiseMethods lists every accepted value of NoiseConfig.Method, in the order
+// the settings page shows them.
+var NoiseMethods = []string{"subtract", "highpass", "off"}
+
+// NormalizeNoiseMethod maps every accepted spelling onto the canonical value. It
+// reports false when the value is not a method at all.
+func NormalizeNoiseMethod(s string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "":
+		return "", false
+	case "subtract", "spectral", "noise", "sub", "on", "true", "1":
+		return "subtract", true
+	case "highpass", "high-pass", "high_pass", "hp":
+		return "highpass", true
+	case "off", "none", "false", "0":
+		return "off", true
+	}
+	return "", false
+}
+
+// normalizedNoise fills in every unset field of a hand-written noise section.
+func normalizedNoise(n NoiseConfig) NoiseConfig {
+	d := DefaultNoiseConfig()
+	if m, ok := NormalizeNoiseMethod(n.Method); ok {
+		n.Method = m
+	} else {
+		n.Method = d.Method
+	}
+	if n.HighPassHz == 0 {
+		n.HighPassHz = d.HighPassHz
+	}
+	if n.Strength == 0 {
+		n.Strength = d.Strength
+	}
+	if n.GainFloorDB == 0 {
+		n.GainFloorDB = d.GainFloorDB
+	}
+	if n.GateMarginDB == 0 {
+		n.GateMarginDB = d.GateMarginDB
+	}
+	if n.GateFloorDBFS == 0 {
+		n.GateFloorDBFS = d.GateFloorDBFS
+	}
+	return n
+}
+
+// Noise docs: the recognition pipeline reads these.
+//
+// DSPMethod returns the fingerprint method name for this configuration, plus
+// whether the spectral stage is on. The mapping lives here (and not in the
+// caller) so the settings file and the recognition pipeline cannot disagree.
+func (n NoiseConfig) DSPMethod() (method string, spectral bool) {
+	m, ok := NormalizeNoiseMethod(n.Method)
+	if !ok {
+		m = DefaultNoiseConfig().Method
+	}
+	return m, m == "subtract"
+}
+
+// AdaptiveEnabled reports whether the adaptive silence gate is on.
+func (n NoiseConfig) AdaptiveEnabled() bool { return n.AdaptiveGate }
+
+// Pipeline describes this configuration in the vocabulary the recognition
+// pipeline uses. It is a plain struct rather than a dsp.NoiseParams so that this
+// package keeps no dependency on internal/dsp (the command layer does the
+// one-line mapping, and the mapping is covered by a test).
+type Pipeline struct {
+	// Spectral reports whether the per-bin spectral gain runs. Method keeps
+	// "highpass" and "off" apart, which both have it off.
+	Spectral bool
+	// Method is the canonical dsp method name: "subtract", "highpass" or "off".
+	Method string
+	// HighPassHz, Strength and GainFloorDB are the spectral settings.
+	HighPassHz  float64
+	Strength    float64
+	GainFloorDB float64
+	// AdaptiveGate, GateMarginDB and GateFloorDBFS configure the silence gate.
+	AdaptiveGate  bool
+	GateMarginDB  float64
+	GateFloorDBFS float64
+}
+
+// Pipeline returns the recognition-pipeline view of this configuration.
+func (n NoiseConfig) Pipeline() Pipeline {
+	method, spectral := n.DSPMethod()
+	return Pipeline{
+		Method:        method,
+		Spectral:      spectral,
+		HighPassHz:    n.HighPassHz,
+		Strength:      n.Strength,
+		GainFloorDB:   n.GainFloorDB,
+		AdaptiveGate:  n.AdaptiveEnabled(),
+		GateMarginDB:  n.GateMarginDB,
+		GateFloorDBFS: n.GateFloorDBFS,
+	}
+}
+
+// dsp.Noise* method names, mirrored so callers do not need their own mapping.
+// They must stay equal to dsp.NoiseOff / NoiseHighPass / NoiseSpectral; the
+// TestNoiseMethodNamesMatchDSP test in the command package enforces that.
+const (
+	// NoiseMethodOff disables the front-end.
+	NoiseMethodOff = "off"
+	// NoiseMethodHighPass runs only the biquad high-pass.
+	NoiseMethodHighPass = "highpass"
+	// NoiseMethodSpectral runs the high-pass plus the per-bin spectral gain.
+	NoiseMethodSpectral = "subtract"
+)
 
 // Normalize returns a copy with canonical spellings (anchor/hotkey).
 func (c *Config) Normalize() *Config {

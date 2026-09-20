@@ -371,38 +371,117 @@ func resample(src []float32, srcRate, dstRate int) []float32 {
 	return out
 }
 
-// AnchorPatch analyses pcm and returns the normalised patch centred on the
-// single loudest frame, together with the index of the frame the patch ends on.
+// anchorSmoothFrames is the length of the centred moving average applied to the
+// frame-energy curve before the anchor frame is chosen.
 //
-// The anchor is the frame with the highest PCM mean-square, not the 186 ms
-// window with the highest summed log-mel. A recall snapshot is several seconds
-// long and the real sound is often only a few tens of milliseconds. Summing
-// energy across the whole window lets the long, quieter background outvote
-// that click, and the stored vector then matches other snapshots' background.
-func AnchorPatch(p dsp.Params, pcm []float32) ([]float32, int, error) {
-	frames := p.Frames(pcm)
-	if len(frames) < p.WindowFrames {
-		return nil, -1, fmt.Errorf("样本太短（%d 帧），凑不满一个 %d 帧的特征窗口", len(frames), p.WindowFrames)
+// Why this is not a nicety: a sound effect is typically a burst of tens of
+// milliseconds, so several frames around its middle have nearly identical
+// energy. Picking the single loudest frame then means that a little ambience
+// decides which frame wins - measured on synthetic bursts, the argmax moved by
+// up to +/-5 frames (27 ms) between two noise realisations. The template and the
+// live window were therefore describing DIFFERENT physical frames, and the
+// cosine score collapsed even though the sound was clearly audible. Smoothing
+// the curve makes the choice a property of the sound's envelope rather than of
+// the noise.
+//
+// 15 frames is about 80 ms at the canonical 5.333 ms hop: long enough to settle
+// the burst's plateau, short enough not to drag the anchor onto a longer
+// background swell.
+const anchorSmoothFrames = 15
+
+// frameEnergies returns the per-frame mean-square of pcm (the same quantity the
+// anchor has always been chosen from).
+func frameEnergies(p dsp.Params, pcm []float32) []float64 {
+	n := p.FrameCount(len(pcm))
+	if n <= 0 {
+		return nil
 	}
-	best := 0
-	bestSq := -1.0
-	for i := range frames {
+	e := make([]float64, n)
+	for i := 0; i < n; i++ {
 		start := i * p.HopSize
 		end := start + p.FrameSize
-		if start < 0 || end > len(pcm) {
+		if end > len(pcm) {
+			end = len(pcm)
+		}
+		if start >= end {
 			continue
 		}
 		var sq float64
 		for _, v := range pcm[start:end] {
 			sq += float64(v) * float64(v)
 		}
-		if sq > bestSq {
-			best, bestSq = i, sq
+		e[i] = sq / float64(end-start)
+	}
+	return e
+}
+
+// smoothEnergies applies a centred moving average of length n (n <= 1 is a
+// no-op). The window shrinks at the edges instead of being padded, so a sound at
+// the very start of a recall is still found.
+func smoothEnergies(e []float64, n int) []float64 {
+	if n <= 1 || len(e) == 0 {
+		return e
+	}
+	half := n / 2
+	out := make([]float64, len(e))
+	for i := range e {
+		lo := i - half
+		if lo < 0 {
+			lo = 0
+		}
+		hi := i + half + 1
+		if hi > len(e) {
+			hi = len(e)
+		}
+		var s float64
+		for k := lo; k < hi; k++ {
+			s += e[k]
+		}
+		out[i] = s / float64(hi-lo)
+	}
+	return out
+}
+
+// anchorFrame returns the frame index the patch should be centred on: the argmax
+// of the smoothed frame-energy curve.
+func anchorFrame(p dsp.Params, pcm []float32) (int, []float64) {
+	e := frameEnergies(p, pcm)
+	if len(e) == 0 {
+		return -1, nil
+	}
+	sm := smoothEnergies(e, anchorSmoothFrames)
+	best, bestV := 0, -1.0
+	for i, v := range sm {
+		if v > bestV {
+			best, bestV = i, v
 		}
 	}
-	// Centre the patch on that frame so a short click is not clipped by the
-	// window edge. The live matcher slides the same window, so the stored
-	// alignment only has to be close.
+	return best, e
+}
+
+// AnchorPatch analyses pcm and returns the normalised patch centred on the
+// sound's energy peak, together with the index of the frame the patch ends on.
+//
+// The anchor is the argmax of the SMOOTHED frame energy (see
+// anchorSmoothFrames), not of the raw frame energy and not the 186 ms window
+// with the highest summed log-mel. A recall snapshot is several seconds long and
+// the real sound is often only a few tens of milliseconds: summing energy across
+// the whole window would let the long, quieter background outvote that click,
+// and the stored vector would then match other snapshots' background.
+//
+// The patch is centred on the anchor so a short click is not clipped by the
+// window edge. The live matcher slides the same window over the audio, so the
+// stored alignment only has to be consistent - which is exactly what the
+// smoothing buys.
+func AnchorPatch(p dsp.Params, pcm []float32) ([]float32, int, error) {
+	frames := p.Frames(pcm)
+	if len(frames) < p.WindowFrames {
+		return nil, -1, fmt.Errorf("样本太短（%d 帧），凑不满一个 %d 帧的特征窗口", len(frames), p.WindowFrames)
+	}
+	best, _ := anchorFrame(p, pcm)
+	if best < 0 {
+		return nil, -1, fmt.Errorf("样本太短（%d 个采样），一帧都算不出来", len(pcm))
+	}
 	half := (p.WindowFrames - 1) / 2
 	start := best - half
 	if start < 0 {
@@ -1008,23 +1087,12 @@ func Decode(raw []byte) (*Index, error) {
 }
 
 // paramsFromJSON restores dsp.Params from the stored canonical document. It
-// uses the same field names as dsp's unexported document, so it is validated by
-// a round-trip check (the fingerprint) right after.
+// decodes into dsp.ParamDoc (the same type dsp hashes) and recomputes the
+// fingerprint from the re-marshalled document, so this package cannot drift from
+// the fingerprint definition: a field added on the dsp side is carried through
+// automatically. TestParamsJSONRoundTrip in dsp locks that property down.
 func (ix *Index) paramsFromJSON(doc string) error {
-	var raw struct {
-		Algorithm    string  `json:"algorithm"`
-		Version      int     `json:"version"`
-		SampleRate   int     `json:"sampleRate"`
-		FrameSize    int     `json:"frameSize"`
-		HopSize      int     `json:"hopSize"`
-		Window       string  `json:"window"`
-		MelBands     int     `json:"melBands"`
-		FMinHz       float64 `json:"fMinHz"`
-		FMaxHz       float64 `json:"fMaxHz"`
-		WindowFrames int     `json:"windowFrames"`
-		Norm         string  `json:"norm"`
-		LogFloorDB   float64 `json:"logFloorDb"`
-	}
+	var raw dsp.ParamDoc
 	if err := json.Unmarshal([]byte(doc), &raw); err != nil {
 		return fmt.Errorf("索引里的特征参数无法解析: %w", err)
 	}
@@ -1044,9 +1112,17 @@ func (ix *Index) paramsFromJSON(doc string) error {
 		FMaxHz:       int(math.Round(raw.FMaxHz)),
 		WindowFrames: raw.WindowFrames,
 	}
+	if len(raw.Noise) > 0 {
+		var n dsp.NoiseParams
+		if err := json.Unmarshal(raw.Noise, &n); err != nil {
+			return fmt.Errorf("索引里的环境音参数无法解析: %w", err)
+		}
+		ix.params.Noise = n
+	}
 	if err := ix.params.Validate(); err != nil {
 		return fmt.Errorf("索引里的特征参数不合法: %w", err)
 	}
+	ix.fp = dsp.FingerprintDoc(raw)
 	return nil
 }
 

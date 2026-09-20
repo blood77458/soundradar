@@ -615,11 +615,17 @@ func TestLevelDBFS(t *testing.T) {
 	a.Reset()
 	sig := sine(LevelWindowSamples, p.SampleRate, 1000, 0.5)
 	a.Push(sig)
-	// RMS of a 0.5-amplitude sine = 0.5/sqrt(2) = -9.03 dBFS
+	// RMS of a 0.5-amplitude sine = 0.5/sqrt(2) = -9.03 dBFS.
+	//
+	// The tolerance is 0.15 dB rather than 0.05 dB because the level meter now
+	// measures the audio AFTER the environment-noise front-end (noise.go), whose
+	// 120 Hz high-pass stage takes a fraction of a dB out of a 1 kHz tone. The
+	// meter and the realtime silence gate have to see the same signal, so
+	// measuring the filtered audio is the consistent choice.
 	want := 20 * math.Log10(0.5/math.Sqrt2)
 	got := a.LevelDBFS()
 	t.Logf("LevelDBFS: 0.5 幅度正弦 = %.4f dBFS (理论 %.4f, 差 %.2e)", got, want, math.Abs(got-want))
-	if math.Abs(got-want) > 0.05 {
+	if math.Abs(got-want) > 0.15 {
 		t.Fatalf("电平等级 %.4f 与理论 %.4f 相差过大", got, want)
 	}
 }

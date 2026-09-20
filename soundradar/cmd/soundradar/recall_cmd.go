@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/znz/soundradar/internal/config"
-	"github.com/znz/soundradar/internal/dsp"
 	"github.com/znz/soundradar/internal/index"
 	"github.com/znz/soundradar/internal/live"
 	"github.com/znz/soundradar/internal/match"
@@ -185,7 +184,7 @@ func runRecall(args []string) error {
 	if err != nil {
 		return fmt.Errorf("索引路径无效: %w", err)
 	}
-	params := dsp.DefaultParams()
+	params := dspParamsFor(cfg.Noise)
 	ix, rebuilt, why, ixErr := index.LoadOrBuild(lib, idx, params)
 	var ixNote string
 	if ixErr != nil {
@@ -209,22 +208,26 @@ func runRecall(args []string) error {
 		src, err = live.NewCaptureSource(cfg.Capture.Device)
 		if err != nil {
 			if !cfg.Capture.FallbackToDefault || cfg.Capture.Device == "" {
+				reportCaptureFailure(os.Stderr, err)
 				return fmt.Errorf("打开采集端点失败: %w", err)
 			}
 			fmt.Fprintf(os.Stderr, "[recall] 端点 %q 打不开（%v），回退到系统默认端点\n", cfg.Capture.Device, err)
 			src, err = live.NewCaptureSource("")
 			if err != nil {
+				reportCaptureFailure(os.Stderr, err)
 				return fmt.Errorf("打开默认采集端点失败: %w", err)
 			}
 		}
 	}
 	defer src.Stop()
+	printSourceNote("[recall] ", src, *quiet)
 
 	// ---- recognition link (this is what fills the ring) ------------------
 	opts := live.Options{
-		TopN:        1,
-		SilenceDBFS: match.DefaultOptions().SilenceDBFS,
-		OnBlock:     rc.PushBlock,
+		TopN:         1,
+		SilenceDBFS:  match.DefaultOptions().SilenceDBFS,
+		AdaptiveGate: params.EffectiveNoise().AdaptiveGate,
+		OnBlock:      rc.PushBlock,
 	}
 	eng, err := live.New(src, ix, opts, func(tk live.Tick) {
 		// Keep the "guess" as fresh as the ranking is: the candidate stores
@@ -478,3 +481,4 @@ func printRecallJSON(r recallJSON) error {
 	fmt.Println(string(b))
 	return nil
 }
+

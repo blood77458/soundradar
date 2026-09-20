@@ -31,7 +31,7 @@ import (
 // a file), computes the fingerprint of every 5.333 ms hop, scores it against
 // the quantised index and prints a live panel of the top-N candidates plus the
 // debounced hits.
-const liveUsage = `soundradar live - 实时识别（听不到也能看到）
+const liveUsage = `soundradar live - 实时识别
 
 用法:
   soundradar live [选项]
@@ -53,7 +53,9 @@ const liveUsage = `soundradar live - 实时识别（听不到也能看到）
 说明:
   特征窗口 186.7 ms、步进 5.333 ms；每个 tick 对应当前窗口的相似度排行。
   静音（低于 -60 dBFS）不打分；命中需要同时通过阈值、margin、冷却三道门。
-  采集链路从不阻塞声卡：处理不过来时丢帧会被计数并在统计里报告。`
+  采集链路从不阻塞声卡：处理不过来时丢块会被计数并在统计里报告。
+  实时面板自带电平条：如果在听却一直没反应，先看那条电平动不动。
+`
 
 // liveEventJSON is one recognised event in the machine readable output.
 type liveEventJSON struct {
@@ -160,10 +162,12 @@ func runLive(args []string) error {
 	} else {
 		src, err = live.NewCaptureSource(*device)
 		if err != nil {
+			reportCaptureFailure(os.Stderr, err)
 			return fmt.Errorf("打开采集端点失败: %w", err)
 		}
 	}
 	defer src.Stop()
+	printSourceNote("[live] ", src, *quiet)
 
 	// ---- renderer / sinks ------------------------------------------------
 	out := newLiveRenderer(os.Stdout, *topN, *asJSON, *quiet, *csvPath)
@@ -173,6 +177,7 @@ func runLive(args []string) error {
 	// The recall ring is filled from the same blocks the analyzer sees, so a
 	// hotkey press during `live` saves exactly what the panel was showing.
 	var rec *recallRecorder
+	liveCfg := config.Default()
 	cfgFile := strings.TrimSpace(*cfgPath)
 	if cfgFile == "" {
 		if p, perr := config.ResolvePath(); perr == nil {
@@ -181,6 +186,7 @@ func runLive(args []string) error {
 	}
 	if cfgFile != "" {
 		if cfg, cerr := config.Load(cfgFile); cerr == nil && cfg != nil {
+			liveCfg = cfg
 			if *recallFlag {
 				cfg.Recall.Enabled = true
 			}
@@ -195,9 +201,18 @@ func runLive(args []string) error {
 	}
 	defer rec.Close()
 
+	// The environment-noise settings come from the same config.json the index
+	// was built with, so `live` recognises exactly what `serve` does.
+	liveParams := dspParamsFor(liveCfg.Noise)
+	if ix.Fingerprint() != liveParams.Fingerprint() {
+		if rebuilt, buildErr := index.BuildWithParams(lib, liveParams); buildErr == nil {
+			ix = rebuilt
+		}
+	}
 	opts := live.Options{
-		TopN:        *topN,
-		SilenceDBFS: match.DefaultOptions().SilenceDBFS,
+		TopN:         *topN,
+		SilenceDBFS:  match.DefaultOptions().SilenceDBFS,
+		AdaptiveGate: liveParams.EffectiveNoise().AdaptiveGate,
 	}
 	if rec.Enabled() {
 		opts.OnBlock = rec.Buffer
@@ -438,7 +453,7 @@ func (r *liveRenderer) drawPanel(tk live.Tick) {
 	frame = append(frame, fmt.Sprintf("电平  %s  %7s dBFS   峰值 %7s dBFS   音频位置 %6.2f s%s",
 		barPct(dbfsPct(tk.LevelDBFS), 30), levelOrNegInf(tk.LevelDBFS), levelOrNegInf(peak),
 		float64(tk.AudioTime.Microseconds())/1e6, silentMark(tk.Silent)))
-	frame = append(frame, "────────────────────────────────────────────────────────────────────────")
+	frame = append(frame, "────────────────────────────────────────────────────────────────────────────")
 	if len(tk.Top) == 0 {
 		frame = append(frame, "（没有分数：静音或索引为空）")
 	}
@@ -490,7 +505,7 @@ func (r *liveRenderer) Summary(st live.Stats, reason string) {
 	if r.tty && r.lines > 0 {
 		fmt.Fprintf(r.w, "\x1b[%dA", r.lines)
 	}
-	fmt.Fprintf(r.w, "\n[live] 结束（%s）: %s\n", reasonText(reason), st.Summary())
+	fmt.Fprintf(r.w, "\n[live] 结束（%s）：%s\n", reasonText(reason), st.Summary())
 }
 
 // Finish prints the end-of-run report and returns any CSV flush error.
@@ -518,7 +533,7 @@ func (r *liveRenderer) Finish(st live.Stats, reason string) error {
 	}
 	fmt.Printf("\n[live] 实时统计\n")
 	fmt.Printf("[live] 音频块     : %d（%d 采样 = %.2f 秒音频）\n", st.Blocks, st.Samples, st.AudioSeconds)
-	fmt.Printf("[live] 打分窗口   : %d（%.3f ms 一个，静音跳过 %d）\n", st.Windows, 1000.0/187.5, st.SilentWindows)
+	fmt.Printf("[live] 打分窗口   : %d（每 5.333 ms 一个，静音跳过 %d）\n", st.Windows, st.SilentWindows)
 	fmt.Printf("[live] tick / 命中: %d / %d\n", st.Ticks, st.Events)
 	fmt.Printf("[live] 丢帧       : %d\n", st.Dropped)
 	fmt.Printf("[live] 处理耗时   : 单块平均 %.3f ms，峰值 %.3f ms；每 20 ms 音频 %.3f ms（预算 %.1f ms）\n",

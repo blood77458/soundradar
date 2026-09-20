@@ -101,6 +101,7 @@ func runMatch(args []string) error {
 	asJSON := fs.Bool("json", false, "machine readable output")
 	minScore := fs.Float64("min-score", match.DefaultOptions().DefaultThreshold, "score below which no verdict is given")
 	quiet := fs.Bool("quiet", false, "print only the verdict")
+	cfgPath := fs.String("config", "", "settings file (default <exe dir>/config.json); its noise section selects the pipeline the index must have been built with")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -121,7 +122,14 @@ func runMatch(args []string) error {
 		return fmt.Errorf("索引路径无效: %w", err)
 	}
 
+	// Only an EXPLICIT --config changes the pipeline here. Probing the default
+	// config.json would make `match --wav` behave differently depending on
+	// whether a noise setting had ever been saved, and would silently rebuild an
+	// index that the running `serve` is using.
 	params := dsp.DefaultParams()
+	if p := strings.TrimSpace(*cfgPath); p != "" {
+		params = dspParamsFor(loadNoiseConfig(p))
+	}
 	ix, rebuilt, why, err := index.LoadOrBuild(lib, idx, params)
 	if err != nil {
 		return fmt.Errorf("准备索引失败: %w", err)

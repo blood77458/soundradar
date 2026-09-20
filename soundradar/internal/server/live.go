@@ -563,6 +563,9 @@ func (h *liveHub) start(cfg LiveConfig) error {
 		TopN:        cfg.TopN,
 		SilenceDBFS: match.DefaultOptions().SilenceDBFS,
 	}
+	// The adaptive silence gate comes from config.json's noise section, so the
+	// live link and the index agree on the pipeline.
+	opts.AdaptiveGate = h.srv.params.EffectiveNoise().AdaptiveGate
 	if cfg.TickMs > 0 {
 		opts.TickEvery = time.Duration(cfg.TickMs) * time.Millisecond
 	}
@@ -684,7 +687,7 @@ func (h *liveHub) indexFor(libraryPath string) (ix *index.Index, idxPath, libPat
 		libPath = abs
 	}
 	idxPath = index.DefaultPathFor(libPath)
-	ix, rebuilt, why, err = index.LoadOrBuild(libPath, idxPath, dsp.DefaultParams())
+	ix, rebuilt, why, err = index.LoadOrBuild(libPath, idxPath, h.srv.params)
 	if err != nil {
 		return nil, idxPath, libPath, false, why, fmt.Errorf("准备索引失败: %w", err)
 	}
@@ -990,3 +993,4 @@ func fingerprintOf(ix *index.Index) string {
 	}
 	return ix.Fingerprint()
 }
+

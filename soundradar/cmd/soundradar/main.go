@@ -37,6 +37,8 @@ import (
 	"time"
 
 	"github.com/znz/soundradar/internal/capture"
+	"github.com/znz/soundradar/internal/config"
+	"github.com/znz/soundradar/internal/dsp"
 	"github.com/znz/soundradar/internal/wav"
 )
 
@@ -51,14 +53,16 @@ var (
 	buildTime = "unknown"
 )
 
-const versionNumber = "0.6.0-p4"
+const versionNumber = "0.7.0-p5"
 
 const usage = `soundradar - game sound recognition assistant
 
 Usage:
-  soundradar devices
+  soundradar                                  (double click: tray + panel + overlay)
+  soundradar devices [--probe]
   soundradar capture --seconds 5 --out test.wav [--device <name substring>]
-  soundradar serve   [--port 8765] [--open] [--library <path>]
+  soundradar serve   [--port 8765] [--open] [--library <path>] [--overlay] [--tray]
+  soundradar tray    [--port 8765] [--no-open] [--no-serve]
   soundradar index rebuild [--library <path>] [--out <index.bin>]
   soundradar match   --wav <file> [--library <path>] [--index <path>] [--top 5] [--json] [--all]
   soundradar live    [--device <substr>] [--library <path>] [--index <path>]
@@ -71,11 +75,20 @@ Usage:
 
 Subcommands:
   devices   List active audio render (output) endpoints and mark the default.
+            --probe also opens every endpoint for loopback once and reports
+            which ones work; use it when recognition reports
+            "IAudioClient::Initialize(shared/loopback) failed".
   capture   Capture speaker loopback and write a 16-bit PCM WAV file.
   serve     Start the sound-effect library management UI + JSON API (P1).
             Listens on 127.0.0.1 only; the web UI is embedded in the binary.
             The "实时打分" tab drives the live link over SSE (/api/live/stream);
             --overlay also creates the native hit popup and the "设置" tab.
+            --tray also puts an icon in the notification area (see tray).
+  tray      Start the tray icon plus a supervised "serve --overlay" child.
+            This is what running the exe with no arguments does, so a double
+            click gives you the tray icon, the management page and the overlay.
+            Left/double click opens the page, right click opens the menu
+            (open panel / candidates / data directory / quit).
   index     Build / refresh the quantised fingerprint index (P2).
   match     Identify which stored sound effects a recording contains (P2).
   live      Realtime recognition: loopback capture -> fingerprint -> ranked panel
@@ -106,16 +119,34 @@ Options for serve:
   --open          open the management UI in the default browser after startup
   --overlay       also create the native hit overlay window (P3), so hits pop up
                   on screen and the "设置" tab can move/resize/preview it
+  --tray          also put a soundradar icon in the notification area; the menu
+                  there can open the panel and exit the whole program
   --config PATH   settings file (default <exe dir>\config.json)
+
+Environment noise:
+  Recognition runs an environment-noise filter (high-pass + per-bin spectral
+  suppression) whose settings live in config.json's "noise" section. They are
+  part of the fingerprint, so changing them makes the next start rebuild
+  data\index.bin from the library (the audio samples themselves are untouched).
 
 Run "soundradar index --help", "soundradar match --help", "soundradar live --help",
 "soundradar overlay --help" or "soundradar recall --help" for the P2/P3/P4 options.
 `
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprint(os.Stderr, usage)
-		os.Exit(2)
+	// No subcommand means the user double-clicked the exe: start the tray
+	// launcher, which brings up the management UI, the realtime link and the
+	// overlay, and gives the process a way to be seen and stopped. A leading
+	// flag is accepted too, so a shortcut can be created with extra arguments
+	// (for example "soundradar.exe" --no-open) without naming a subcommand.
+	// Every command-line invocation keeps working exactly as before.
+	if len(os.Args) < 2 || strings.HasPrefix(os.Args[1], "-") &&
+		!isTopLevelFlag(os.Args[1]) {
+		if err := runTray(os.Args[1:]); err != nil {
+			fmt.Fprintf(os.Stderr, "soundradar: %v\n", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	var err error
@@ -126,6 +157,8 @@ func main() {
 		err = runCapture(os.Args[2:])
 	case "serve", "web", "ui":
 		err = runServe(os.Args[2:])
+	case "tray", "notify", "trayicon":
+		err = runTray(os.Args[2:])
 	case "index", "idx":
 		err = runIndex(os.Args[2:])
 	case "match", "identify":
@@ -164,8 +197,65 @@ func printVersion() {
 	fmt.Printf("  cgo       : %s\n", cgoState)
 }
 
+// isTopLevelFlag reports whether a leading argument is one of the program-level
+// flags (help / version) rather than an option of the implicit tray launcher.
+func isTopLevelFlag(arg string) bool {
+	switch arg {
+	case "-h", "--help", "help", "-v", "--version", "--ver", "version":
+		return true
+	}
+	return false
+}
+
+// dspNoiseParams maps the settings file's noise section onto the fingerprint
+// parameters. It is the ONE place where the two representations meet, so the
+// index, the live link and the CLI all agree on what the user configured.
+//
+// It starts from dsp.DefaultNoiseParams and overrides the fields the settings
+// file actually exposes: the document deliberately does not offer every knob
+// (the track length, the dry/wet mix and the frame gate stay internal), and
+// those must keep their documented defaults rather than becoming zero.
+func dspNoiseParams(n config.NoiseConfig) dsp.NoiseParams {
+	p := n.Pipeline()
+	out := dsp.DefaultNoiseParams()
+	out.Method = p.Method
+	out.HighPassHz = p.HighPassHz
+	out.OverSubtract = p.Strength
+	out.GainFloorDB = p.GainFloorDB
+	out.AdaptiveGate = p.AdaptiveGate
+	out.GateMarginDB = p.GateMarginDB
+	out.GateFloorDBFS = p.GateFloorDBFS
+	return out
+}
+
+// dspParamsFor returns the full fingerprint parameters for a configuration.
+func dspParamsFor(n config.NoiseConfig) dsp.Params {
+	return dsp.DefaultParams().WithNoise(dspNoiseParams(n))
+}
+
+// loadNoiseConfig reads the settings file (or the default path when the caller
+// did not name one) and returns its noise section. A missing or unreadable file
+// yields the recommended defaults rather than an error: every recognition
+// command works without a config.json.
+func loadNoiseConfig(path string) config.NoiseConfig {
+	if strings.TrimSpace(path) == "" {
+		p, err := config.DefaultPath()
+		if err != nil {
+			return config.DefaultNoiseConfig()
+		}
+		path = p
+	}
+	cfg, err := config.Load(path)
+	if err != nil || cfg == nil {
+		return config.DefaultNoiseConfig()
+	}
+	return cfg.Normalize().Noise
+}
+
 func runDevices(args []string) error {
 	fs := flag.NewFlagSet("devices", flag.ContinueOnError)
+	probe := fs.Bool("probe", false,
+		"also try to open every endpoint for loopback and report which ones work")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -196,6 +286,35 @@ func runDevices(args []string) error {
 		}
 		fmt.Printf("  [%d] %s%s\n", d.Index, d.Name, tag)
 		fmt.Printf("      id: %s\n", d.ID)
+	}
+
+	if !*probe {
+		fmt.Printf("\n提示：加 --probe 可以逐个端点试着打开一次，用来排查\n" +
+			"      “IAudioClient::Initialize(shared/loopback) failed” 这类错误。\n")
+		return nil
+	}
+
+	fmt.Printf("\n逐个端点尝试打开共享模式回环采集：\n\n")
+	probes, err := c.Probe()
+	if err != nil {
+		return err
+	}
+	ok, failed := 0, 0
+	for _, p := range probes {
+		fmt.Println(p.String())
+		if p.OK {
+			ok++
+		} else {
+			failed++
+		}
+	}
+	fmt.Printf("\n可用 %d 个，打不开 %d 个。\n", ok, failed)
+	if ok == 0 {
+		fmt.Printf("所有端点都打不开。先关掉音频增强/空间音效，确认 Windows Audio 服务在运行，\n" +
+			"再关掉可能独占声卡的程序（播放器、直播/录音软件）后重试。\n")
+	} else if failed > 0 {
+		fmt.Printf("识别时会自动跳过打不开的端点，改用可用的那个（默认端点在列表最前面）。\n" +
+			"想固定用某一个：soundradar serve --device \"<名字片段>\"\n")
 	}
 	return nil
 }
@@ -241,6 +360,9 @@ func runCapture(args []string) error {
 		if res != nil {
 			reportCapture(res, time.Since(start))
 		}
+		// Give the actionable report instead of a bare HRESULT: this command is
+		// the first thing a user runs when recognition produces nothing.
+		reportCaptureFailure(os.Stderr, err)
 		return err
 	}
 
@@ -263,6 +385,16 @@ func runCapture(args []string) error {
 		return err
 	}
 	fmt.Printf("[capture] wav        : %s (%.1f KiB on disk)\n", *out, float64(st.Size())/1024)
+	// A capture that "succeeded" but is entirely silent is the most confusing
+	// outcome of all: the command exits 0 and the recognition will simply never
+	// fire. Say something about it.
+	if res.Silent {
+		fmt.Printf("\n[capture] 注意：这一整段录音全是数字静音（每个采样都是 0）。\n")
+		fmt.Printf("[capture]       说明声音没有走到被监听的端点，或者现在确实没有声音在播放。\n")
+		fmt.Printf("[capture]       检查：游戏/播放器的输出设备、音量合成器里是否被静音、\n")
+		fmt.Printf("[capture]       游戏是否用了 WASAPI 独占模式（独占时回环抓不到）。\n")
+		fmt.Printf("[capture]       换端点试试：soundradar devices --probe，再 --device \"<名字片段>\"。\n")
+	}
 	fmt.Printf("[capture] ok\n")
 	return nil
 }

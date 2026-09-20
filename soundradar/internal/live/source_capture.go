@@ -131,6 +131,17 @@ func (s *captureSource) Device() capture.Device { return s.st.Device }
 // Stream returns the underlying capture stream (nil-safe).
 func (s *captureSource) Stream() *capture.Stream { return s.st }
 
+// StreamNote reports how the endpoint was chosen: an empty Note means the
+// requested endpoint accepted its own mix format, and Skipped lists the
+// endpoints that were tried and refused first. The CLI prints this at startup so
+// a substitution is never silent.
+func (s *captureSource) StreamNote() (string, []capture.EndpointFailure) {
+	if s == nil || s.st == nil {
+		return "", nil
+	}
+	return s.st.Note, s.st.Skipped
+}
+
 // Info describes the endpoint for the banner/API.
 func (s *captureSource) Info() SourceInfo {
 	d := s.st.Device

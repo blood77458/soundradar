@@ -53,10 +53,15 @@ import (
 const (
 	// Algorithm names the feature family; it is stored in index files and must
 	// change whenever the pipeline changes shape.
-	Algorithm = "mel-goertzel-v1"
+	//
+	// v2 added the environment-noise front-end (noise.go), which changes every
+	// produced vector, so it is a NEW algorithm name rather than a new version:
+	// an index built by v1 is refused with a readable message instead of being
+	// searched with mismatched vectors.
+	Algorithm = "mel-goertzel-v2"
 	// Version is the fingerprint implementation version, bumped on any change
 	// that alters the produced numbers.
-	Version = 1
+	Version = 2
 	// Norm describes the patch post-processing; it is stored in the index so a
 	// mismatch is detected as clearly as a parameter mismatch.
 	Norm = "mean-subtract+l2"
@@ -159,9 +164,16 @@ type Params struct {
 	FMinHz       int // 40
 	FMaxHz       int // 16000
 	WindowFrames int // 32
+
+	// Noise is the environment-noise front-end (noise.go). Its zero value means
+	// "the recommended defaults", so a hand-built Params from before this
+	// feature still describes the current pipeline. Params is a value type:
+	// NormalizeNoise copies a Params with an explicitly filled-in Noise field.
+	Noise NoiseParams
 }
 
-// DefaultParams returns the parameters mandated by the P2 specification.
+// DefaultParams returns the parameters mandated by the P2 specification, with
+// the recommended environment-noise settings.
 func DefaultParams() Params {
 	return Params{
 		SampleRate:   48000,
@@ -171,8 +183,20 @@ func DefaultParams() Params {
 		FMinHz:       40,
 		FMaxHz:       16000,
 		WindowFrames: 32,
+		Noise:        DefaultNoiseParams(),
 	}
 }
+
+// WithNoise returns a copy of p with n installed (defaults filled in). It is how
+// the application config reaches the fingerprint without every caller having to
+// remember which fields exist.
+func (p Params) WithNoise(n NoiseParams) Params {
+	p.Noise = n
+	return p
+}
+
+// EffectiveNoise returns the noise parameters with defaults filled in.
+func (p Params) EffectiveNoise() NoiseParams { return p.Noise.withDefaults() }
 
 // Dim is the fingerprint vector length: MelBands values per frame times
 // WindowFrames frames in one patch.
@@ -204,7 +228,7 @@ func (p Params) Validate() error {
 	case p.WindowFrames < 1:
 		return fmt.Errorf("窗口帧数必须为正数，当前 %d", p.WindowFrames)
 	}
-	return nil
+	return p.Noise.Validate()
 }
 
 // fpDoc is the canonical JSON document hashed by Fingerprint. Field order is
@@ -227,6 +251,42 @@ type fpDoc struct {
 	// relative floor and from the original absolute -20 dBFS clamp. Changing
 	// it changes the stored vectors, so LoadOrBuild rebuilds the index.
 	FloorMode string `json:"floorMode"`
+	// Noise is the environment-noise front-end (noise.go). It is part of the
+	// document because it changes every produced vector: an index built with
+	// different noise settings must be rebuilt, and hashing this block is what
+	// detects that.
+	Noise noiseDoc `json:"noise"`
+}
+
+// noiseDoc is the canonical, JSON-safe form of NoiseParams: every field is a
+// scalar and the method is already normalised by withDefaults, so the same
+// settings always produce the same bytes (and therefore the same fingerprint).
+type noiseDoc struct {
+	Method        string  `json:"method"`
+	HighPassHz    float64 `json:"highPassHz"`
+	OverSubtract  float64 `json:"overSubtract"`
+	GainFloorDB   float64 `json:"gainFloorDb"`
+	Mix           float64 `json:"mix"`
+	TrackFrames   int     `json:"trackFrames"`
+	AdaptiveGate  bool    `json:"adaptiveGate"`
+	GateMarginDB  float64 `json:"gateMarginDb"`
+	GateFloorDBFS float64 `json:"gateFloorDbfs"`
+}
+
+// noiseParamsDoc rounds the noise settings for the fingerprint document.
+func noiseParamsDoc(n NoiseParams) noiseDoc {
+	n = n.withDefaults()
+	return noiseDoc{
+		Method:        n.Method,
+		HighPassHz:    math.Round(n.HighPassHz*1000) / 1000,
+		OverSubtract:  math.Round(n.OverSubtract*1000) / 1000,
+		GainFloorDB:   math.Round(n.GainFloorDB*1000) / 1000,
+		Mix:           math.Round(n.Mix*1000) / 1000,
+		TrackFrames:   n.TrackFrames,
+		AdaptiveGate:  n.AdaptiveGate,
+		GateMarginDB:  math.Round(n.GateMarginDB*1000) / 1000,
+		GateFloorDBFS: math.Round(n.GateFloorDBFS*1000) / 1000,
+	}
 }
 
 // doc builds the canonical parameter document.
@@ -245,6 +305,7 @@ func (p Params) doc() fpDoc {
 		Norm:         Norm,
 		LogFloorDB:   math.Round(10 * math.Log10(LogFloor)),
 		FloorMode:    "window-relative",
+		Noise:        noiseParamsDoc(p.Noise),
 	}
 }
 
@@ -267,6 +328,80 @@ func (p Params) ParamJSON() []byte {
 	b, err := json.MarshalIndent(p.doc(), "", "  ")
 	if err != nil {
 		panic("dsp: 无法序列化特征参数: " + err.Error())
+	}
+	return b
+}
+
+// ParamDoc is the canonical parameter document as an opaque JSON value. It is
+// what internal/index stores and re-marshals to recompute the fingerprint, so
+// the two packages cannot drift: a field added to the document here is carried
+// through the index file automatically.
+type ParamDoc struct {
+	Algorithm    string          `json:"algorithm"`
+	Version      int             `json:"version"`
+	SampleRate   int             `json:"sampleRate"`
+	FrameSize    int             `json:"frameSize"`
+	HopSize      int             `json:"hopSize"`
+	Window       string          `json:"window"`
+	MelBands     int             `json:"melBands"`
+	FMinHz       float64         `json:"fMinHz"`
+	FMaxHz       float64         `json:"fMaxHz"`
+	WindowFrames int             `json:"windowFrames"`
+	Norm         string          `json:"norm"`
+	LogFloorDB   float64         `json:"logFloorDb"`
+	FloorMode    string          `json:"floorMode"`
+	Noise        json.RawMessage `json:"noise"`
+}
+
+// ParamDocOf builds the canonical document of p (the same bytes Fingerprint
+// hashes and ParamJSON renders).
+func (p Params) ParamDocOf() ParamDoc {
+	return ParamDoc{
+		Algorithm:    Algorithm,
+		Version:      Version,
+		SampleRate:   p.SampleRate,
+		FrameSize:    p.FrameSize,
+		HopSize:      p.HopSize,
+		Window:       "hann-periodic",
+		MelBands:     p.MelBands,
+		FMinHz:       math.Round(float64(p.FMinHz)),
+		FMaxHz:       math.Round(float64(p.FMaxHz)),
+		WindowFrames: p.WindowFrames,
+		Norm:         Norm,
+		LogFloorDB:   math.Round(10 * math.Log10(LogFloor)),
+		FloorMode:    "window-relative",
+		Noise:        noiseRaw(p.Noise),
+	}
+}
+
+// FingerprintDoc returns the sha256 of the given document. internal/index uses
+// it to recompute the fingerprint of a document read from a file, which is what
+// detects "the parameters changed" without duplicating this struct.
+func FingerprintDoc(d ParamDoc) string {
+	b, err := json.Marshal(d)
+	if err != nil {
+		panic("dsp: 无法序列化特征参数: " + err.Error())
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// FingerprintOfDocJSON is FingerprintDoc for a document that is still JSON text.
+func FingerprintOfDocJSON(doc []byte) (string, error) {
+	var d ParamDoc
+	if err := json.Unmarshal(doc, &d); err != nil {
+		return "", err
+	}
+	return FingerprintDoc(d), nil
+}
+
+// noiseRaw marshals the noise block into the document. A marshal failure is
+// impossible for a struct of scalars; it panics rather than silently producing a
+// fingerprint that does not cover the noise settings.
+func noiseRaw(n NoiseParams) json.RawMessage {
+	b, err := json.Marshal(noiseParamsDoc(n))
+	if err != nil {
+		panic("dsp: 无法序列化环境音参数: " + err.Error())
 	}
 	return b
 }
@@ -632,6 +767,13 @@ type Analyzer struct {
 	wframe []float32 // windowed frame scratch
 	power  []float64
 
+	// noise is the environment-noise front-end (noise.go). It is created from
+	// Params.Noise and, when active, filters every sample in Push and subtracts
+	// the tracked noise floor from every frame's power spectrum in emitFrameAt.
+	// It is deliberately applied to templates (index build) and live audio
+	// alike, so both sides of the comparison see the same processing.
+	noise *noiseReducer
+
 	// sring holds the samples still addressable by emitFrameAt, i.e. the
 	// absolute sample range [sbase, stot). Frame i starts at i*HopSize, so a
 	// frame needs at most the previous FrameSize samples; keeping the whole
@@ -639,6 +781,12 @@ type Analyzer struct {
 	// and releases the dropped samples (the offline paths never trim, so their
 	// behaviour is unchanged).
 	sring []float32
+	// rring holds the SAME sample range as sring but unfiltered: the audio
+	// exactly as it arrived. It exists solely for frameEnergyAt, because both
+	// the frame-level noise gate and the index anchor must be judged on the real
+	// audio rather than on the front-end's output (the high-pass stage would
+	// otherwise change what counts as "loud").
+	rring []float32
 	sbase int64 // absolute index of sring[0]
 	stot  int64 // total samples ever pushed
 
@@ -655,6 +803,14 @@ type Analyzer struct {
 	// why the realtime path calls Trim.
 	frames [][]float32
 	fbase  int64 // absolute index of frames[0]
+	// rawEnergy holds the mean-square of every frame measured on the audio as
+	// received, BEFORE the noise front-end ran. It exists because the frame-level
+	// noise gate can legitimately zero a frame that contains the sound itself
+	// (when the ambience is as loud as the sound), and an anchor chosen from the
+	// gated frames would then point at the ambience instead of at the sound. The
+	// index builder and the live anchor search therefore use this raw curve.
+	rawEnergy []float64
+	rbase     int64 // absolute index of rawEnergy[0]
 	// ftot is the total number of frames ever emitted (NOT len(frames) once
 	// trimming has happened); WindowAt/Frame take absolute frame indices.
 	ftot int64
@@ -682,6 +838,7 @@ func NewAnalyzer(p Params) (*Analyzer, error) {
 		frames: make([][]float32, 0, 256),
 	}
 	hannPeriodic(a.win)
+	a.noise = newNoiseReducer(p.Noise, p.SampleRate, p.FrameSize, p.HopSize, a.plan)
 	return a, nil
 }
 
@@ -695,8 +852,11 @@ func (a *Analyzer) Reset() {
 		a.lring[i] = 0
 	}
 	a.frames = a.frames[:0]
+	a.rawEnergy = a.rawEnergy[:0]
 	a.stot, a.ltot, a.ftot = 0, 0, 0
 	a.sbase, a.fbase = 0, 0
+	a.rbase = 0
+	a.noise.reset()
 }
 
 // ReleaseFrames drops the historical frame buffer (and therefore makes
@@ -710,7 +870,9 @@ func (a *Analyzer) Reset() {
 // realtime link needs Trim instead: this method alone still leaks 192 kB/s.
 func (a *Analyzer) ReleaseFrames() {
 	a.frames = a.frames[:0]
+	a.rawEnergy = a.rawEnergy[:0]
 	a.fbase = 0
+	a.rbase = 0
 	a.ftot = 0
 }
 
@@ -745,11 +907,21 @@ func (a *Analyzer) Trim(keepFrames int) {
 		a.frames = a.frames[:keepFrames]
 		a.fbase += int64(drop)
 	}
+	if drop := len(a.rawEnergy) - keepFrames; drop > 0 {
+		copy(a.rawEnergy, a.rawEnergy[drop:])
+		a.rawEnergy = a.rawEnergy[:keepFrames]
+		a.rbase += int64(drop)
+	}
 	if len(a.frames) < cap(a.frames)/4 && cap(a.frames) > 4*keepFrames {
 		// A one-off huge Push would otherwise leave a big backing array behind.
 		slim := make([][]float32, len(a.frames), keepFrames)
 		copy(slim, a.frames)
 		a.frames = slim
+	}
+	if len(a.rawEnergy) < cap(a.rawEnergy)/4 && cap(a.rawEnergy) > 4*keepFrames {
+		slim := make([]float64, len(a.rawEnergy), keepFrames)
+		copy(slim, a.rawEnergy)
+		a.rawEnergy = slim
 	}
 	a.ftot = a.fbase + int64(len(a.frames))
 
@@ -760,12 +932,19 @@ func (a *Analyzer) Trim(keepFrames int) {
 	if drop := len(a.sring) - keep; drop > 0 {
 		copy(a.sring, a.sring[drop:])
 		a.sring = a.sring[:keep]
+		copy(a.rring, a.rring[drop:])
+		a.rring = a.rring[:keep]
 		a.sbase += int64(drop)
 	}
 	if cap(a.sring) > 4*keep {
 		slim := make([]float32, len(a.sring), keep)
 		copy(slim, a.sring)
 		a.sring = slim
+	}
+	if cap(a.rring) > 4*keep {
+		slim := make([]float32, len(a.rring), keep)
+		copy(slim, a.rring)
+		a.rring = slim
 	}
 }
 
@@ -779,15 +958,37 @@ func (a *Analyzer) BufferedFrames() int { return len(a.frames) }
 
 // Push appends an arbitrary number of 48 kHz mono samples and analyses every
 // frame that has become complete.
+//
+// The noise front-end runs first and hands back a filtered copy of the same
+// samples, so the audio the caller passed in is never modified. A front-end that
+// is switched off leaves the samples untouched, which is what keeps the
+// `noise.method: off` path bit-identical to the pre-noise-reduction pipeline.
 func (a *Analyzer) Push(pcm []float32) {
 	p := a.p
-	for _, v := range pcm {
+	if len(pcm) == 0 {
+		return
+	}
+	in := pcm
+	filtered := pcm
+	if a.noise != nil {
+		a.noise.Push(pcm)
+		if out := a.noise.Out(); len(out) == len(in) {
+			filtered = out
+		}
+	}
+	for i, raw := range in {
+		v := filtered[i]
 		a.sring = append(a.sring, v)
+		a.rring = append(a.rring, raw)
 		a.lring[int(a.ltot)%LevelWindowSamples] = v
 		a.stot++
 		a.ltot++
-		// A frame ending at sample stot-1 starts at stot-FrameSize.
+		// A frame ending at sample stot-1 starts at stot-FrameSize. The noise
+		// estimator is advanced to this frame's END first, so the attenuation
+		// it applies was built from audio that is at least one frame older than
+		// the frame itself (see noiseReducer.AdvanceTo).
 		if off := a.stot - int64(p.FrameSize); off >= 0 && off%int64(p.HopSize) == 0 {
+			a.noise.AdvanceTo(int(a.stot))
 			a.emitFrameAt(off)
 		}
 	}
@@ -828,6 +1029,18 @@ func (a *Analyzer) emitFrameAt(start int64) {
 		return
 	}
 	off := int(start - a.sbase)
+	// The frame-level noise gate and the anchor both judge the REAL audio, so
+	// the raw energy is recorded before anything is decided.
+	raw := a.rring[off : off+p.FrameSize]
+	a.rawEnergy = append(a.rawEnergy, frameMeanSquare(raw))
+	// Frame-level SNR gate (noise.go): a frame that holds nothing but ambience
+	// must not contribute to the patch at all. Skipping the whole analysis is
+	// both cheaper and cleaner than attenuating a spectrum that is pure noise.
+	if a.noise.frameGate(frameLevelDBFS(raw)) {
+		a.frames = append(a.frames, make([]float32, p.MelBands))
+		a.ftot = a.fbase + int64(len(a.frames))
+		return
+	}
 	// Gather + de-mean + window.
 	var sum float32
 	for i := 0; i < p.FrameSize; i++ {
@@ -839,8 +1052,12 @@ func (a *Analyzer) emitFrameAt(start int64) {
 		a.wframe[i] = a.demean[i] * a.win[i]
 	}
 	a.plan.spectrum(a.power, a.wframe)
+	// Environment-noise reduction: attenuate the tracked stationary noise power
+	// before the mel bank integrates it. Inactive (and a single branch) when the
+	// front-end is off or has no estimate yet.
+	a.noise.apply(a.power)
 
-	raw := make([]float64, p.MelBands)
+	melRaw := make([]float64, p.MelBands)
 	for c := 0; c < p.MelBands; c++ {
 		var e float64
 		base := c * a.bank.Bins
@@ -849,9 +1066,9 @@ func (a *Analyzer) emitFrameAt(start int64) {
 				e += w * a.power[b]
 			}
 		}
-		raw[c] = e
+		melRaw[c] = e
 	}
-	a.frames = append(a.frames, logMel(raw))
+	a.frames = append(a.frames, logMel(melRaw))
 	a.ftot = a.fbase + int64(len(a.frames))
 }
 
@@ -906,6 +1123,31 @@ func (a *Analyzer) Frame(i int) []float32 {
 	return a.frames[j]
 }
 
+// FrameEnergyAt returns the mean-square of the audio of absolute frame i,
+// measured on the audio AS RECEIVED (before the noise front-end). It is what the
+// anchor search must use: the front-end's frame gate can zero a frame that holds
+// the sound itself, and an anchor picked from gated frames would point at the
+// ambience instead. It returns -1 when i is outside the retained history.
+func (a *Analyzer) FrameEnergyAt(i int) float64 {
+	j := i - int(a.rbase)
+	if j < 0 || j >= len(a.rawEnergy) {
+		return -1
+	}
+	return a.rawEnergy[j]
+}
+
+// FrameEnergyCount returns how many raw frame energies are retained.
+func (a *Analyzer) FrameEnergyCount() int { return len(a.rawEnergy) }
+
+// FrameEnergy returns the mean-square of the audio of every retained frame
+// measured before the noise front-end, in chronological order, together with the
+// absolute index of the first one.
+func (a *Analyzer) FrameEnergy() ([]float64, int) {
+	out := make([]float64, len(a.rawEnergy))
+	copy(out, a.rawEnergy)
+	return out, int(a.rbase)
+}
+
 // LevelDBFS returns the RMS level of roughly the last 50 ms (2400 samples) in
 // dBFS, i.e. 20*log10(rms). Digital silence maps to -Inf.
 func (a *Analyzer) LevelDBFS() float64 {
@@ -926,6 +1168,51 @@ func (a *Analyzer) LevelDBFS() float64 {
 		return math.Inf(-1)
 	}
 	return 20 * math.Log10(rms)
+}
+
+// NoiseFloorDBFS returns the tracked environment-noise floor in dBFS, or -Inf
+// while the front-end is off or has not measured anything yet. It is comparable
+// with LevelDBFS: both are the RMS of a ~20 ms window, one of the newest audio
+// and one of the quietest recent audio.
+func (a *Analyzer) NoiseFloorDBFS() float64 {
+	if a.noise == nil {
+		return math.Inf(-1)
+	}
+	return a.noise.NoiseFloorDBFS()
+}
+
+// GateDBFS returns the silence gate the realtime matcher should use, given the
+// configured absolute gate. With Noise.AdaptiveGate on, it is
+// max(configured, noiseFloor+Noise.GateMarginDB) clamped to Noise.GateFloorDBFS,
+// so a noisy game raises the gate above its own ambience while a quiet one keeps
+// the configured -60 dBFS. It never lowers the gate below the configuration.
+func (a *Analyzer) GateDBFS(configured float64) float64 {
+	if a.noise == nil {
+		return configured
+	}
+	return a.noise.gateDBFS(configured)
+}
+
+// frameLevelDBFS is the RMS level of one analysis frame in dBFS, used by the
+// frame-level SNR gate. Digital silence maps to -Inf.
+func frameLevelDBFS(frame []float32) float64 {
+	sq := frameMeanSquare(frame)
+	if sq <= 0 {
+		return math.Inf(-1)
+	}
+	return 10 * math.Log10(sq)
+}
+
+// frameMeanSquare is the mean of the squares of frame, i.e. the frame's power.
+func frameMeanSquare(frame []float32) float64 {
+	if len(frame) == 0 {
+		return 0
+	}
+	var sq float64
+	for _, v := range frame {
+		sq += float64(v) * float64(v)
+	}
+	return sq / float64(len(frame))
 }
 
 // LevelDBFSOf returns the RMS level in dBFS of a whole buffer (helper for

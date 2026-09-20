@@ -21,4 +21,6 @@ func (unsupportedCapturer) Capture(string, time.Duration) (*Result, error) {
 	return nil, ErrUnsupported
 }
 
+func (unsupportedCapturer) Probe() ([]DeviceProbe, error) { return nil, ErrUnsupported }
+
 func (unsupportedCapturer) Close() error { return nil }

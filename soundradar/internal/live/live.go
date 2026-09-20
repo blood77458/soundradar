@@ -41,6 +41,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/znz/soundradar/internal/capture"
 	"github.com/znz/soundradar/internal/dsp"
 	"github.com/znz/soundradar/internal/index"
 	"github.com/znz/soundradar/internal/match"
@@ -98,6 +99,14 @@ type SourceInfo struct {
 
 // InfoReporter is implemented by the built-in sources.
 type InfoReporter interface{ Info() SourceInfo }
+
+// StreamNoteReporter is implemented by sources that had to substitute an
+// endpoint or a format to start capturing. The returned note is empty when the
+// requested endpoint accepted its own mix format, and skipped lists the
+// endpoints that were tried and refused first (oldest first).
+type StreamNoteReporter interface {
+	StreamNote() (note string, skipped []capture.EndpointFailure)
+}
 
 // EventSink receives recognised events.
 type EventSink interface{ OnEvent(ev match.Event) }
@@ -175,6 +184,12 @@ type Options struct {
 	TickEvery time.Duration
 	// SilenceDBFS is passed to match.Options.SilenceDBFS. Default -60.
 	SilenceDBFS float64
+	// AdaptiveGate, when true, raises the silence gate above the analyzed
+	// audio's own noise floor (dsp.NoiseParams.AdaptiveGate) instead of using
+	// SilenceDBFS as a constant. It defaults to OFF so that a zero-value Options
+	// behaves exactly as it always did; the application enables it from
+	// config.json's noise.adaptiveGate.
+	AdaptiveGate bool
 	// Frames, when non-empty, is processed directly instead of the source
 	// (offline/test injection); the engine still runs the full feature+match
 	// path. src may then be nil.
@@ -262,6 +277,12 @@ type Engine struct {
 	tickSamples int64
 	lastTop     []index.ItemScore
 	lastSilent  bool
+
+	// adaptive turns on the noise-floor-driven silence gate, and gateDBFS is the
+	// value last pushed into the matcher (so the mutex is only taken when it
+	// actually changed).
+	adaptive bool
+	gateDBFS float64
 }
 
 // New builds an engine over idx (which may be nil: the level meter and the
@@ -301,7 +322,35 @@ func New(src FrameSource, idx *index.Index, opts Options, onTick func(Tick), onE
 		onEvent:     onEvent,
 		queue:       make(chan []float32, opts.QueueBlocks),
 		tickSamples: tickSamples,
+		adaptive:    opts.AdaptiveGate,
+		gateDBFS:    opts.MatchOptions.SilenceDBFS,
 	}, nil
+}
+
+// adaptGate recomputes the adaptive silence gate from the analyzer's noise-floor
+// tracker and pushes it into the matcher when it moved by more than a hair.
+// Called on the Run goroutine, once per audio block.
+func (e *Engine) adaptGate() {
+	want := e.an.GateDBFS(e.opts.MatchOptions.SilenceDBFS)
+	if want == e.gateDBFS {
+		return
+	}
+	e.gateDBFS = want
+	e.matcher.SetSilenceDBFS(want)
+}
+
+// NoiseFloorDBFS returns the current environment-noise floor estimate in dBFS,
+// or -Inf when the front-end has not measured anything yet. It is comparable
+// with Tick.LevelDBFS and with Options.SilenceDBFS.
+func (e *Engine) NoiseFloorDBFS() float64 { return e.an.NoiseFloorDBFS() }
+
+// GateDBFS returns the silence gate currently in force (the configured one, or
+// the adaptive one when that is enabled and the floor is higher).
+func (e *Engine) GateDBFS() float64 {
+	if !e.adaptive {
+		return e.opts.MatchOptions.SilenceDBFS
+	}
+	return e.an.GateDBFS(e.opts.MatchOptions.SilenceDBFS)
 }
 
 func shortFP(fp string) string {
@@ -528,6 +577,15 @@ func (e *Engine) process(blk []float32) {
 
 			pos := e.pushed
 			level := e.an.LevelDBFS()
+			// Adaptive silence gate: with the environment-noise tracker running,
+			// the gate follows the ambience instead of the fixed -60 dBFS, so a
+			// noisy game stops scoring (and reporting) empty windows while a
+			// quiet one keeps the configured sensitivity. It is pushed at most
+			// once per block, and only when it actually moved, so the matcher's
+			// hot path stays untouched.
+			if e.adaptive {
+				e.adaptGate()
+			}
 			ev, top := e.matcher.Tick(w, level, e.stamp(pos))
 			if top != nil {
 				e.lastTop, e.lastSilent = top, false

@@ -100,8 +100,15 @@ func (r *recallRecorder) OnHotkey() {
 func (r *recallRecorder) Buffer(block []float32) { r.rec.PushBlock(block) }
 
 // Observe is the live.Options.OnTick tap: it keeps the "guess" as fresh as the
-// ranking is.
-func (r *recallRecorder) Observe(tk live.Tick) { r.rec.Tick(tk.Top) }
+// ranking is, which is what a candidate saved right now should be labelled with.
+//
+// It deliberately does NOT watch for silence. The realtime views already show a
+// live level meter (the `live` panel and the 实时打分 tab), so "am I hearing
+// anything at all?" is answerable by looking at it; a timed popup on top of that
+// is noise, and it would fire during every pause, menu and loading screen.
+func (r *recallRecorder) Observe(tk live.Tick) {
+	r.rec.Tick(tk.Top)
+}
 
 // Store exposes the candidate inbox.
 func (r *recallRecorder) Store() *recall.Store {
@@ -260,6 +267,14 @@ func startCaptureRecorder(ctx context.Context, device string, rec *recallRecorde
 	return cr, nil
 }
 
+// recallScoringParams returns the fingerprint parameters the recall ring's
+// "guess what this was" scorer uses. It mirrors what the long-lived commands use
+// (serve/overlay/recall), so a candidate saved from `serve` and one saved from
+// the standalone `recall` CLI score against the same pipeline.
+func recallScoringParams() dsp.Params {
+	return dspParamsFor(loadNoiseConfig(""))
+}
+
 // pump converts, buffers and scores until the context is cancelled.
 func (cr *captureRecorder) pump() {
 	defer close(cr.done)
@@ -270,7 +285,7 @@ func (cr *captureRecorder) pump() {
 	var (
 		acc      []float32
 		an       *dsp.Analyzer
-		params   = dsp.DefaultParams()
+		params   = recallScoringParams()
 		lastTick = time.Now()
 	)
 	if cr.ix != nil && !cr.ix.Empty() {
@@ -365,7 +380,7 @@ func feedFileRecorder(path string, rec *recallRecorder, ix *index.Index) error {
 
 // feedFrameSource is the shared "drain a FrameSource into a ring" helper.
 func feedFrameSource(src live.FrameSource, rc *recall.Recaller, ix *index.Index) error {
-	params := dsp.DefaultParams()
+	params := recallScoringParams()
 	var (
 		an  *dsp.Analyzer
 		acc []float32
