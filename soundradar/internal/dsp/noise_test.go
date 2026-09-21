@@ -317,6 +317,134 @@ func TestNoiseGateBehaviour(t *testing.T) {
 	}
 }
 
+func TestDenoisedLevelSitsBelowSteadyNoise(t *testing.T) {
+	a, err := NewAnalyzer(DefaultParams())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rng := rand.New(rand.NewSource(7))
+	amp := math.Pow(10, -30.0/20)
+	pcm := make([]float32, 48000*2)
+	for i := range pcm {
+		pcm[i] = float32((rng.Float64()*2 - 1) * amp * math.Sqrt(3))
+	}
+	a.Push(pcm)
+	lv, dn := a.LevelDBFS(), a.DenoisedLevelDBFS()
+	t.Logf("持续噪声 电平 %.2f dBFS，去噪后 %.2f dBFS，压低 %.2f dB", lv, dn, lv-dn)
+	if dn > lv-1 {
+		t.Fatalf("去噪后电平 %.2f 应明显低于当前电平 %.2f", dn, lv)
+	}
+}
+
+// clickBurst is a deterministic broadband click sample, used to check that a
+// short mechanical hit is not erased bin-by-bin by the Wiener gain.
+func clickBurst(i int) float64 {
+	s := uint32(i+17)*1664525 + 1013904223
+	return (float64(s>>8)/float64(1<<24))*2 - 1
+}
+
+// TestNoiseReductionKeepsShortClick is the fingerprint equivalent of the
+// listening-demo's short-transient paste-back: a 20 ms broadband hit must
+// trigger the energy detector, and the Wiener stage must not erase it on top
+// of the high-pass. Broadband clicks in heavy ambience are not expected to
+// beat the unfiltered cosine — the high-pass strips the click envelope, which
+// is the same on the template and the query.
+func TestNoiseReductionKeepsShortClick(t *testing.T) {
+	const (
+		n      = 28800
+		at     = 9600
+		length = 960 // 20 ms at 48 kHz
+		amb    = 0.5
+	)
+	loudClick := func(i int) float64 { return 1.0 * clickBurst(i) }
+	measure := func(method string) float64 {
+		p := DefaultParams()
+		p.Noise.Method = method
+		ref := patchOf(t, p, burstPCM(n, at, length, 0.002, loudClick))
+		live := patchOf(t, p, burstPCM(n, at, length, amb, loudClick))
+		return cosine(ref, live)
+	}
+	off, hp, on := measure(NoiseOff), measure(NoiseHighPass), measure(NoiseSpectral)
+	t.Logf("20 ms 点击自身相似度：关闭 %.4f / 仅高通 %.4f / 谱减 %.4f", off, hp, on)
+	if on < hp-0.03 {
+		t.Fatalf("谱减把短点击压得比仅高通更差: %.4f -> %.4f", hp, on)
+	}
+
+	live := burstPCM(n, at, length, amb, loudClick)
+	a, err := NewAnalyzer(DefaultParams())
+	if err != nil {
+		t.Fatal(err)
+	}
+	protected := 0
+	for off := 0; off < n; {
+		step := 256
+		if off+step > n {
+			step = n - off
+		}
+		a.Push(live[off : off+step])
+		off += step
+		if a.noise != nil && a.noise.protectFrame {
+			protected++
+		}
+	}
+	t.Logf("短点击期间保护了 %d 帧", protected)
+	if protected < 2 {
+		t.Fatalf("20 ms 点击没有触发短时保护（保护帧 %d）", protected)
+	}
+
+	clean := burstPCM(n, at, length, 0.0005, loudClick)
+	hpP := DefaultParams()
+	hpP.Noise.Method = NoiseHighPass
+	dot := cosine(patchOf(t, hpP, clean), patchOf(t, DefaultParams(), clean))
+	t.Logf("干净短点击 仅高通 vs 谱减 自相似度 = %.6f", dot)
+	if dot < 0.98 {
+		t.Fatalf("谱减把干净短点击改得比仅高通更厉害（相似度 %.6f）", dot)
+	}
+}
+
+// TestNoiseTrackerSkipsNarrowEvent checks the event-aware floor: a 1 kHz beep
+// lasting a quarter second must not be written into the 1 kHz noise bin,
+// otherwise the next beep would be treated as ambience.
+func TestNoiseTrackerSkipsNarrowEvent(t *testing.T) {
+	p := DefaultParams()
+	a, err := NewAnalyzer(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rng := rand.New(rand.NewSource(7))
+	const (
+		n   = 48000
+		amb = 0.08
+	)
+	pcm := make([]float32, n)
+	for i := range pcm {
+		pcm[i] = float32((rng.Float64()*2 - 1) * amb * math.Sqrt(3))
+		if i >= n/2 && i < n*3/4 {
+			pcm[i] += float32(0.18 * math.Sin(2*math.Pi*1000*float64(i)/48000))
+		}
+	}
+	a.Push(pcm)
+	if a.noise == nil || !a.noise.noiseReady {
+		t.Fatal("噪声估计还没就绪")
+	}
+	bin := int(math.Round(1000 * float64(p.FrameSize) / float64(p.SampleRate)))
+	if bin <= 2 || bin >= len(a.noise.noise)-2 {
+		t.Fatalf("1 kHz 频点 %d 超出范围", bin)
+	}
+	toneN := a.noise.noise[bin]
+	var neigh float64
+	count := 0
+	for _, b := range []int{bin - 4, bin - 3, bin + 3, bin + 4} {
+		neigh += a.noise.noise[b]
+		count++
+	}
+	neigh /= float64(count)
+	t.Logf("1 kHz 噪声估计 %.3e，邻频 %.3e（比 %.2f 倍）", toneN, neigh, toneN/math.Max(neigh, 1e-18))
+	if toneN > neigh*20 {
+		t.Fatalf("1 kHz 提示音被学进了底噪（该频点 %.3e，邻频 %.3e）", toneN, neigh)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // pipeline invariants
 // ---------------------------------------------------------------------------

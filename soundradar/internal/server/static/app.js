@@ -48,17 +48,73 @@ function collectHints(containerId) {
   return out;
 }
 
+function appendHintUploads(fd, containerId) {
+  const box = $(containerId);
+  if (!box || !fd) return;
+  let i = 0;
+  box.querySelectorAll('.hintRow').forEach((row) => {
+    const grid = (row.querySelector('.hintGrid') || {}).value || '';
+    const name = (row.querySelector('.hintName') || {}).value || '';
+    if (!String(grid).trim() && !String(name).trim()) return;
+    const inp = row.querySelector('.hintIconInput');
+    const f = inp && inp.files && inp.files[0];
+    if (f) fd.append('hintIcon' + i, f, f.name);
+    i += 1;
+  });
+}
+
+function hintRowHasUpload(containerId) {
+  const box = $(containerId);
+  if (!box) return false;
+  let found = false;
+  box.querySelectorAll('.hintRow').forEach((row) => {
+    const grid = (row.querySelector('.hintGrid') || {}).value || '';
+    const name = (row.querySelector('.hintName') || {}).value || '';
+    if (!String(grid).trim() && !String(name).trim()) return;
+    const inp = row.querySelector('.hintIconInput');
+    if (inp && inp.files && inp.files[0]) found = true;
+  });
+  return found;
+}
+
 function renderHintEditor(containerId, hints) {
   const box = $(containerId);
   if (!box) return;
   box.innerHTML = '';
   const list = (hints && hints.length) ? hints : [{ grid: '', name: '' }];
-  list.forEach((h) => appendHintRow(box, h.grid || '', h.name || ''));
+  list.forEach((h) => appendHintRow(box, h.grid || '', h.name || '', h.iconUrl || ''));
 }
 
-function appendHintRow(box, grid, name) {
+function appendHintRow(box, grid, name, iconUrl) {
   const row = document.createElement('div');
   row.className = 'hintRow';
+
+  const file = document.createElement('input');
+  file.type = 'file';
+  file.className = 'hintIconInput';
+  file.accept = '.png,.jpg,.jpeg,image/png,image/jpeg';
+  file.hidden = true;
+
+  const thumb = document.createElement('button');
+  thumb.type = 'button';
+  thumb.className = 'hintThumb' + (iconUrl ? '' : ' empty');
+  thumb.title = '上传对照图';
+  const img = document.createElement('img');
+  img.alt = '';
+  if (iconUrl) img.src = iconUrl;
+  thumb.appendChild(img);
+  thumb.onclick = (e) => { e.preventDefault(); file.click(); };
+  file.onchange = () => {
+    const f = file.files && file.files[0];
+    if (!f) return;
+    img.src = URL.createObjectURL(f);
+    thumb.classList.remove('empty');
+  };
+
+  const pic = document.createElement('div');
+  pic.appendChild(thumb);
+  pic.appendChild(file);
+
   const g = document.createElement('input');
   g.type = 'text';
   g.className = 'hintGrid';
@@ -79,10 +135,43 @@ function appendHintRow(box, grid, name) {
     row.remove();
     if (!box.querySelector('.hintRow')) appendHintRow(box, '', '');
   };
+  row.appendChild(pic);
   row.appendChild(g);
   row.appendChild(n);
   row.appendChild(del);
   box.appendChild(row);
+}
+
+function groupHintsByGrid(hints) {
+  const order = [];
+  const map = new Map();
+  (hints || []).forEach((h) => {
+    const key = String(h.grid || '').toLowerCase().replace(/×/g, 'x').replace(/\s+/g, '');
+    if (!map.has(key)) {
+      map.set(key, []);
+      order.push(key);
+    }
+    map.get(key).push(h);
+  });
+  return order.map((key) => ({
+    grid: key.replace(/x/gi, '×'),
+    items: map.get(key),
+  }));
+}
+
+function hintCard(h) {
+  const card = document.createElement('div');
+  card.className = 'hitGuessCard';
+  const hi = document.createElement('img');
+  hi.alt = h.name || '';
+  if (h.iconUrl) hi.src = h.iconUrl;
+  else hi.className = 'missingIcon';
+  card.appendChild(hi);
+  const n = document.createElement('div');
+  n.className = 'itemName';
+  n.textContent = h.name || '';
+  card.appendChild(n);
+  return card;
 }
 
 let bannerTimer = null;
@@ -344,6 +433,7 @@ async function submitCreate(e) {
   fd.append('tags', $('cTags').value);
   fd.append('note', $('cNote').value);
   fd.append('displayHints', JSON.stringify(collectHints('cHints')));
+  appendHintUploads(fd, 'cHints');
   fd.append('threshold', $('cThreshold').value);
   fd.append('cooldownMs', $('cCooldown').value);
   fd.append('profile', $('cProfile').value);
@@ -398,7 +488,6 @@ async function loadDetail(id) {
     $('dIconInput').value = '';
     renderDetailTags(it.tags || []);
     renderHintEditor('dHints', it.displayHints || []);
-    renderDetailHintIcons(it);
     renderSamples();
   } catch (err) {
     banner('加载条目失败：' + err.message, 'err');
@@ -414,39 +503,6 @@ function renderDetailTags(tags) {
     sp.className = 'tag';
     sp.textContent = t;
     box.appendChild(sp);
-  });
-}
-
-function renderDetailHintIcons(it) {
-  let box = $('dHintIcons');
-  if (!box) {
-    box = document.createElement('div');
-    box.id = 'dHintIcons';
-    box.className = 'hitGuessGrid';
-    const host = $('dHints');
-    if (host && host.parentNode) host.parentNode.insertBefore(box, host.nextSibling);
-  }
-  box.innerHTML = '';
-  const hints = (it && it.displayHints) || [];
-  if (!hints.length) { box.classList.add('hidden'); return; }
-  box.classList.remove('hidden');
-  hints.forEach((h, i) => {
-    const card = document.createElement('div');
-    card.className = 'hitGuessCard';
-    const img = document.createElement('img');
-    img.alt = h.name || '';
-    if (h.iconUrl) img.src = h.iconUrl;
-    else img.className = 'missingIcon';
-    card.appendChild(img);
-    const g = document.createElement('div');
-    g.className = 'gridTag';
-    g.textContent = String(h.grid || '').replace(/x/gi, '×');
-    card.appendChild(g);
-    const n = document.createElement('div');
-    n.className = 'itemName';
-    n.textContent = h.name || '';
-    card.appendChild(n);
-    box.appendChild(card);
   });
 }
 
@@ -511,11 +567,13 @@ async function saveDetail() {
     profile: $('dProfile').value.trim() || 'default',
   };
   const iconFile = $('dIconInput').files[0];
+  const hintFiles = hintRowHasUpload('dHints');
   let opts;
-  if (iconFile) {
+  if (iconFile || hintFiles) {
     const fd = new FormData();
     fd.append('patch', JSON.stringify(body));
-    fd.append('icon', iconFile, iconFile.name);
+    if (iconFile) fd.append('icon', iconFile, iconFile.name);
+    appendHintUploads(fd, 'dHints');
     opts = { method: 'PATCH', body: fd };
   } else {
     opts = {
@@ -813,6 +871,15 @@ function renderTick(t) {
   $('levelText').textContent = (db === null || db === undefined) ? '静音（-∞）' : Number(db).toFixed(1) + ' dBFS';
   $('levelFill').style.width = dbfsPct(db) + '%';
 
+  const clean = t.denoised;
+  let cleanLabel = (clean === null || clean === undefined) ? '—' : Number(clean).toFixed(1) + ' dBFS';
+  if (typeof db === 'number' && typeof clean === 'number' && isFinite(db) && isFinite(clean)) {
+    const cut = db - clean;
+    if (cut >= 0.05) cleanLabel += `（压低 ${cut.toFixed(1)} dB）`;
+  }
+  $('denoisedText').textContent = cleanLabel;
+  $('denoisedFill').style.width = dbfsPct(clean) + '%';
+
   const now = Date.now();
   if (typeof db === 'number' && db > live.peak) { live.peak = db; live.peakAt = now; }
   // 峰值保持 1.5 s，然后按 20 dB/s 回落。
@@ -931,27 +998,22 @@ function renderHitGuess(ev) {
     box.appendChild(alone);
     return;
   }
-  const grid = document.createElement('div');
-  grid.className = 'hitGuessGrid';
-  hints.forEach((h, i) => {
-    const card = document.createElement('div');
-    card.className = 'hitGuessCard';
-    const hi = document.createElement('img');
-    hi.alt = h.name || '';
-    if (h.iconUrl) hi.src = h.iconUrl;
-    else hi.className = 'missingIcon';
-    card.appendChild(hi);
-    const g = document.createElement('div');
-    g.className = 'gridTag';
-    g.textContent = String(h.grid || '').replace(/x/gi, '×');
-    card.appendChild(g);
-    const n = document.createElement('div');
-    n.className = 'itemName';
-    n.textContent = h.name || '';
-    card.appendChild(n);
-    grid.appendChild(card);
+  const groups = document.createElement('div');
+  groups.className = 'hitGuessGroups';
+  groupHintsByGrid(hints).forEach((g) => {
+    const sec = document.createElement('div');
+    sec.className = 'hitGuessGroup';
+    const lab = document.createElement('div');
+    lab.className = 'hitGuessGroupLabel';
+    lab.textContent = g.grid || '未标注格子';
+    sec.appendChild(lab);
+    const grid = document.createElement('div');
+    grid.className = 'hitGuessGrid';
+    g.items.forEach((h) => grid.appendChild(hintCard(h)));
+    sec.appendChild(grid);
+    groups.appendChild(sec);
   });
-  box.appendChild(grid);
+  box.appendChild(groups);
 }
 
 function renderEvents() {
@@ -1214,9 +1276,9 @@ function applyConfigToForm(cfg) {
   const n = c.noise || {};
   $('setNoiseMethod').value = n.method || 'subtract';
   $('setNoiseHighPass').value = numText(n.highPassHz) === '—' ? 120 : n.highPassHz;
-  $('setNoiseStrength').value = numText(n.strength) === '—' ? 2 : n.strength;
-  $('setNoiseGainFloor').value = numText(n.gainFloorDb) === '—' ? -14 : n.gainFloorDb;
-  $('setNoiseGateMargin').value = numText(n.gateMarginDb) === '—' ? 6 : n.gateMarginDb;
+  $('setNoiseStrength').value = numText(n.strength) === '—' ? 1.5 : n.strength;
+  $('setNoiseGainFloor').value = numText(n.gainFloorDb) === '—' ? -8 : n.gainFloorDb;
+  $('setNoiseGateMargin').value = numText(n.gateMarginDb) === '—' ? 4 : n.gateMarginDb;
   $('setNoiseGateFloor').value = numText(n.gateFloorDbfs) === '—' ? -70 : n.gateFloorDbfs;
   $('setNoiseAdaptive').checked = n.adaptiveGate !== false;
   setText('setNoiseState',
@@ -1785,6 +1847,7 @@ async function promoteCandidate(id) {
     displayHints: target ? undefined : collectHints('candHints_' + id),
   }));
   if (iconFile) fd.append('icon', iconFile, iconFile.name);
+  if (!target) appendHintUploads(fd, 'candHints_' + id);
 
   setStatus('candStatus_' + id, '提交中…');
   try {

@@ -20,51 +20,44 @@
 // template and query always see the same processing:
 //
 //  1. high-pass   a 2nd-order Butterworth high-pass (default 120 Hz) removes
-//     rumble, wind and DC, i.e. the part of the ambience that lives
-//     below the lowest mel band anyway (FMinHz = 40 Hz is only a
-//     corner; a real 60 Hz hum has most of its energy down there).
-//  2. noise track a minimum-statistics estimator: a 1024-point STFT of the
-//     DELAYED signal (see below) estimates the stationary power of
-//     every one of the 513 bins as the minimum over the last ~256 ms,
-//     smoothed over time in the power domain.
-//  3. subtract    per bin, |X|^2 is replaced by max(|X|^2 - alpha*N, beta*|X|^2).
-//     alpha (over-subtraction, default 1.9) makes up for the fact that a
-//     minimum statistic under-estimates the mean; beta (spectral floor,
-//     default 0.22) bounds the attenuation at about -6.6 dB so a bin in
-//     which the estimator was wrong cannot be erased. It deliberately is
-//     NOT the classic "subtract magnitude and clamp at 1 %" (a -20 dB
-//     notch): mild noise left in place costs far less similarity than a
-//     hollowed-out spectrum.
-//
-// The estimator is fed with audio that is at least one FrameSize old
-// (delay == 1024 samples == 21.3 ms). Without that delay a loud sound would be
-// inside its own noise estimate and the subtraction would delete the very
-// sound we want to recognise; with it, the estimate only ever describes what
-// the audio was doing before the sound arrived.
+//     rumble, wind and DC.
+//  2. noise track per-bin event-aware tracking (not minimum statistics). A
+//     bin that sticks up above the floor is a tone or a short event and is
+//     NOT taught to the floor. A rise that covers most bins for ~200 ms is a
+//     scene change and is learned. This is the tracker that does not assume
+//     the target is speech, and it does not need a white-noise bias factor.
+//  3. Wiener gain each analysis bin is multiplied by S/(S+αN), floored at
+//     GainFloorDB. The patch is normalised, so only spectral SHAPE matters:
+//     a gain keeps high-SNR bins (the sound) and suppresses low-SNR bins
+//     (the ambience). Classic magnitude subtraction would flatten that
+//     contrast. Listening-oriented floors around 0.05 are deliberately not
+//     used; hollowing a bin out costs more cosine than leaving mild noise.
+//  4. transients  a ~10 ms energy detector marks short bursts. Those analysis
+//     frames skip the Wiener gain so a broadband click is not erased bin by
+//     bin. Longer rises update the energy floor instead (a new scene, not a
+//     click). This is the fingerprint equivalent of paste-back: we do not
+//     reconstruct a waveform.
 //
 // # The reported noise floor
 //
 // The adaptive silence gate needs a level, not a spectrum, and a level that
-// means the same thing as LevelDBFS. The estimator's spectral minimum is a
-// perfectly good subtraction reference that is however NOT a dBFS level: an
-// unwindowed Hann FFT bin of white noise sits ~23 dB above the signal's RMS
-// (the window's coherent gain plus the per-bin noise bandwidth). So the floor
-// is tracked separately, in the TIME domain: a slow minimum of the 20 ms block
-// RMS, which drops instantly and rises with a ~2 s time constant. That number
-// is directly comparable with LevelDBFS and with config's silence gate.
+// means the same thing as LevelDBFS. The per-bin tracker is a subtraction
+// reference that is however NOT a dBFS level. So the floor is tracked
+// separately, in the TIME domain: a slow minimum of the 20 ms block RMS,
+// which drops instantly and rises with a ~2 s time constant.
 //
 // # Why it does not hurt clean recordings
 //
 // The estimator is relative and self-scaling: a studio-clean sample has a noise
-// minimum 40-60 dB below its signal, so alpha*N is negligible and the
-// subtraction is a no-op. A quiet sample keeps its low floor, so "sound recorded
-// quietly" still matches "the same sound heard through game ambience".
+// floor far below its signal, so αN is negligible and the gain is a no-op. A
+// quiet sample keeps its low floor, so "sound recorded quietly" still matches
+// "the same sound heard through game ambience".
 //
 // # Cost
 //
-// One biquad per sample, plus one extra 1024-point FFT per 512 samples (twice
-// the STFT work the analysis itself does), which is still far below the 10 ms
-// per 20 ms of audio budget the live link must respect.
+// One biquad per sample, plus one extra 1024-point FFT per analysis hop, which
+// is still far below the 10 ms per 20 ms of audio budget the live link must
+// respect.
 package dsp
 
 import (
@@ -78,8 +71,28 @@ const (
 	NoiseOff = "off"
 	// NoiseHighPass runs only the biquad high-pass (cheapest, no FFT).
 	NoiseHighPass = "highpass"
-	// NoiseSpectral is the documented default: high-pass + spectral subtraction.
+	// NoiseSpectral is the documented default: high-pass + spectral gain.
 	NoiseSpectral = "subtract"
+)
+
+// Event-aware tracker / short-transient detector. Time constants match the
+// listening-demo spectralDenoise; the Wiener floor and over-subtraction stay
+// at the fingerprint-oriented defaults (see DefaultNoiseParams).
+const (
+	noiseTrackFast     = 0.55 // track = (1-fast)*track + fast*power
+	noiseTrackSlow     = 0.03 // noise += slow*(track-noise) on non-event bins
+	noiseSceneMix      = 0.25 // noise += mix*(track-noise) on a scene change
+	noiseHotRatio      = 4.0  // track > noise*this => bin is "hot"
+	noiseEventRatio    = 3.5  // track > noise*this => do not update that bin
+	noiseBroadFrac     = 3    // hot bins > bins/this => broadband rise
+	noiseInitFrames    = 5    // average this many frames before the tracker is live
+	noiseSceneSeconds  = 0.20 // broadband rise this long is a new scene
+	transientWinSec    = 0.010
+	transientRatio     = 2.0  // ~3 dB; 2.8 was for waveform paste-back
+	transientMaxHops   = 6    // ~32 ms of analysis hops; longer rises are a new scene
+	transientFloorFast = 0.15 // energy floor when a long rise is a new scene
+	transientFloorSlow = 0.08 // energy floor on ordinary frames
+	gainReleasePrev    = 0.75 // per-bin gain falls slowly, rises immediately
 )
 
 // NoiseParams configures the environment-noise front-end.
@@ -94,33 +107,18 @@ type NoiseParams struct {
 	// default (120 Hz); a value >= SampleRate/2 disables just the filter.
 	HighPassHz float64 `json:"highPassHz"`
 	// OverSubtract (alpha) inflates the estimated noise power before the gain is
-	// derived. It covers the fact that a per-bin minimum under-estimates the
-	// mean noise power (the minimum of N samples of an exponential distribution
-	// sits well below its mean) and it is the main "how aggressive" knob.
+	// derived. It is the main "how aggressive" knob.
 	OverSubtract float64 `json:"overSubtract"`
 	// GainFloorDB bounds how far ONE bin may be attenuated. It is a gain in dB
-	// (default -8 dB, i.e. a bin whose SNR is hopeless is kept at about 0.4 of its
-	// power), not a fraction of the original power: a floor expressed as
-	// "keep x % of the power" would clamp every quiet bin to the same value and
-	// leave the noise's spectral shape in the patch, which is exactly what
-	// breaks the cosine score. A gain floor still lets a hopeless bin go far
-	// below the signal bins, so the noise shape stops dominating.
+	// (default -8 dB, i.e. a bin whose SNR is hopeless is kept at about 0.4 of
+	// its amplitude). A floor expressed as "keep x % of the power" would clamp
+	// every quiet bin to the same value and leave the noise's spectral shape in
+	// the patch, which is exactly what breaks the cosine score.
 	GainFloorDB float64 `json:"gainFloorDb"`
 	// Mix blends the noise-reduced spectrum back into the original one: 1 keeps
 	// only the cleaned spectrum, 0 makes the gain a no-op. It exists so the
 	// effect can be dialled back without being switched off.
 	Mix float64 `json:"mix"`
-	// TrackFrames is how many delayed analysis frames the minimum statistic
-	// looks at (default 24 frames = 256 ms at a 512-sample hop).
-	TrackFrames int `json:"trackFrames"`
-	// BiasCorrect undoes the minimum statistic's downward bias. The minimum of N
-	// exponentially distributed bin POWERS has expectation mean/(N^2+N), so a
-	// raw minimum under-estimates the noise by that factor (about 600x at
-	// N = 24) and the resulting gain would be indistinguishable from 1 - which is
-	// exactly the bug that made the first version of this filter a no-op. 0
-	// means "derive it from TrackFrames"; a value <= 0 disables the correction
-	// (only useful for tests).
-	BiasCorrect float64 `json:"biasCorrect"`
 	// FrameGateDB is the optional frame-level signal-to-noise gate: a frame whose
 	// level is less than this many dB above the tracked noise floor is dropped
 	// before the patch is normalised. It is DISABLED by default (a negative
@@ -154,7 +152,6 @@ func DefaultNoiseParams() NoiseParams {
 		OverSubtract:  1.5,
 		GainFloorDB:   -8,
 		Mix:           1.0,
-		TrackFrames:   24,
 		FrameGateDB:   -1, // disabled; see the field documentation
 		AdaptiveGate:  true,
 		GateMarginDB:  4,
@@ -183,12 +180,6 @@ func (n NoiseParams) withDefaults() NoiseParams {
 	}
 	if n.Mix == 0 {
 		n.Mix = d.Mix
-	}
-	if n.TrackFrames == 0 {
-		n.TrackFrames = d.TrackFrames
-	}
-	if n.BiasCorrect == 0 {
-		n.BiasCorrect = minimumBias(float64(n.TrackFrames))
 	}
 	if n.FrameGateDB == 0 {
 		// 0 is not a usable gate value (it would gate nothing), so it keeps the
@@ -242,9 +233,6 @@ func (n NoiseParams) Validate() error {
 		if n.GainFloorDB < -60 || n.GainFloorDB > 0 {
 			return fmt.Errorf("单频点增益下限应在 -60-0 dB 之间，当前 %v", n.GainFloorDB)
 		}
-		if n.TrackFrames < 4 || n.TrackFrames > 256 {
-			return fmt.Errorf("噪声统计帧数应在 4-256 之间，当前 %d", n.TrackFrames)
-		}
 	}
 	if n.Mix < 0 || n.Mix > 1 {
 		return fmt.Errorf("干湿比应在 [0, 1] 之间，当前 %v", n.Mix)
@@ -262,21 +250,6 @@ func (n NoiseParams) Validate() error {
 
 // Enabled reports whether any processing happens at all.
 func (n NoiseParams) Enabled() bool { return n.withDefaults().Method != NoiseOff }
-
-// minimumBias returns the factor that turns the expected minimum of N
-// exponentially distributed powers back into their mean.
-//
-// For i.i.d. Exp(mean m) powers, the minimum of N draws has expectation m/(N^2+N)
-// (the minimum of N Exp(1) variables is Exp(N), whose mean is 1/N, but the
-// estimator sees the minimum of the AMPLITUDES and squares it, which contributes
-// the second 1/(N+1)). Multiplying the squared minimum by N*(N+1) is therefore
-// the unbiased estimate of the mean bin power.
-func minimumBias(n float64) float64 {
-	if n < 1 {
-		n = 1
-	}
-	return n * (n + 1)
-}
 
 // defaultSampleRate mirrors Params' documented canonical rate; Validate needs it
 // before any Params exists.
@@ -375,6 +348,7 @@ type noiseReducer struct {
 	hpOff bool
 
 	plan *fft // the analyzer's FFT plan (FrameSize points)
+	hop  int  // analyzer hop; windows are aligned with analysis frames
 
 	// out is exactly the filtered audio of the current Push call, i.e. what the
 	// analyzer analyses, indexed like the input the caller passed in.
@@ -384,35 +358,45 @@ type noiseReducer struct {
 	// histBuf[i] is the sample at absolute position histBase+i. It only has to
 	// cover the windows that have not been built yet plus one window of overlap,
 	// and it is trimmed when a window is consumed.
-	//
-	// Keeping a history keyed by ABSOLUTE position is what makes the estimator
-	// independent of the caller's chunking: a window is defined by its start
-	// position alone, so the same windows are built no matter how the audio
-	// arrived. Any scheme that keeps "the unconsumed tail" in the per-Push
-	// buffer instead has to reconstruct the same thing from chunk-dependent
-	// state, which is easy to get subtly wrong and impossible to test in bulk.
 	histBuf  []float32
-	histBase int // absolute position of histBuf[0]
-	histEnd  int // absolute position one past histBuf[len-1]
+	rawBuf   []float32 // original samples, for the 10 ms transient detector
+	histBase int       // absolute position of histBuf[0]
+	histEnd  int       // absolute position one past histBuf[len-1]
 	// winStart is the absolute start position of the next estimator window to
 	// build. Windows are hop-aligned, so it is always a multiple of hop.
 	winStart int
 
-	// hist is a circular history of per-bin AMPLITUDE spectra of the last
-	// TrackFrames estimator blocks.
-	hist     []float64
-	histFill int
-	histNext int
-
-	// noise is the per-bin noise power used for subtraction, and totalNoise is
-	// its sum (0 means "nothing measured yet, do not touch the spectrum").
+	// track is the per-bin smoothed power; noise is the per-bin floor. totalNoise
+	// is the sum of noise (0 means "nothing measured yet, do not touch the
+	// spectrum").
+	track      []float64
 	noise      []float64
+	gainMem    []float64
 	totalNoise float64
+	noiseReady bool
+	initCount  int
+	initNeed   int
+	broadRun   int
+	broadNeed  int
 
 	// scratch
 	binPow []float64
 	win    []float32
 	block  []float32
+
+	// short-transient detector: ~10 ms energy ending at the current frame.
+	// It is evaluated on the same window apply() will see, so a click that
+	// starts inside this frame is not delayed until a later 10 ms hop ends.
+	energyWin    int
+	energyFloor  float64
+	energyRuns   int
+	energyPrimed bool
+	protectFrame bool
+	lastEnergy   float64
+	// lastCutDB is how many dB the latest analysis frame's broadband power was
+	// reduced by the Wiener gain. Zero when the frame was passed through
+	// (tracker not ready, or a short click that skips the gain).
+	lastCutDB float64
 
 	// --- time-domain noise-floor tracker (dBFS-comparable) ---
 	frames int
@@ -436,15 +420,35 @@ type noiseReducer struct {
 // reducer reuses it (same goroutine, never nested).
 func newNoiseReducer(p NoiseParams, rate, frameSize, hopSize int, plan *fft) *noiseReducer {
 	p = p.withDefaults()
-	_ = hopSize
+	hop := hopSize
+	if hop <= 0 || hop > plan.n {
+		hop = plan.n / 4
+		if hop < 1 {
+			hop = 1
+		}
+	}
+	broadNeed := int(math.Round(noiseSceneSeconds / (float64(hop) / float64(rate))))
+	if broadNeed < 4 {
+		broadNeed = 4
+	}
+	energyWin := int(math.Round(transientWinSec * float64(rate)))
+	if energyWin < 32 {
+		energyWin = 32
+	}
+	_ = frameSize
 	r := &noiseReducer{
-		p:      p,
-		plan:   plan,
-		hist:   make([]float64, p.TrackFrames*(plan.n/2+1)),
-		noise:  make([]float64, plan.n/2+1),
-		binPow: make([]float64, plan.n/2+1),
-		win:    make([]float32, plan.n),
-		block:  make([]float32, plan.n),
+		p:         p,
+		plan:      plan,
+		hop:       hop,
+		track:     make([]float64, plan.n/2+1),
+		noise:     make([]float64, plan.n/2+1),
+		gainMem:   make([]float64, plan.n/2+1),
+		binPow:    make([]float64, plan.n/2+1),
+		win:       make([]float32, plan.n),
+		block:     make([]float32, plan.n),
+		initNeed:  noiseInitFrames,
+		broadNeed: broadNeed,
+		energyWin: energyWin,
 		// out grows to at most one Push worth plus the estimator's two-window
 		// lookahead, and is compacted at the end of every Push.
 		out: make([]float32, 0, 4*plan.n),
@@ -489,6 +493,7 @@ func (r *noiseReducer) Push(v []float32) {
 		return
 	}
 	r.histBuf = append(r.histBuf, r.out...)
+	r.rawBuf = append(r.rawBuf, v...)
 	r.histEnd += len(r.out)
 }
 
@@ -496,22 +501,17 @@ func (r *noiseReducer) Push(v []float32) {
 // samples received since the last Reset. The analyzer calls it once per frame,
 // right before that frame is analysed.
 //
-// That placement is what keeps the estimator causal: a frame is only ever
-// compared against an estimate built from audio that ENDED at least one frame
-// earlier, never from audio that has not been analysed yet. Advancing the
-// estimator once per Push instead would make the result depend on how the
-// caller chunked its audio, because a 4096-sample block would let the estimator
-// see far-future audio while the analyzer scored frames from the start of it.
-//
-// A window is built exactly when its samples are available and the analyzer has
-// reached its end, so the set of windows built (and their contents) is a
-// function of the sample positions alone.
+// Windows are hop-aligned with the analysis frames and end at pos, so the last
+// window built is the frame about to be scored. Event bins in that frame are
+// not written into the noise floor (see trackBlock); the Wiener gain then uses
+// the floor as it was before the event. Advancing once per Push instead would
+// make the result depend on how the caller chunked its audio.
 func (r *noiseReducer) AdvanceTo(pos int) {
 	if r == nil || !r.spectral() {
 		return
 	}
 	frame := r.plan.n
-	hop := frame / 2
+	hop := r.hop
 	for r.winStart+frame <= pos {
 		if r.winStart < r.histBase {
 			// The samples were already trimmed away (the analyzer skipped
@@ -520,19 +520,23 @@ func (r *noiseReducer) AdvanceTo(pos int) {
 			continue
 		}
 		off := r.winStart - r.histBase
+		if off < 0 || off+frame > len(r.histBuf) {
+			r.winStart += hop
+			continue
+		}
 		for i := 0; i < frame; i++ {
 			r.block[i] = r.histBuf[off+i] * r.win[i]
 		}
 		r.trackBlock()
+		r.protectFrame = r.feedFrameEnergy(r.winStart, r.winStart+frame)
 		r.winStart += hop
 	}
 	r.trimHistory()
 }
 
 // trimHistory drops the samples the estimator can no longer need: everything
-// before the next window's start, keeping one window for the sliding overlap.
+// before the next STFT window.
 func (r *noiseReducer) trimHistory() {
-	frame := r.plan.n
 	keepFrom := r.winStart - r.histBase
 	if keepFrom <= 0 {
 		return
@@ -540,10 +544,14 @@ func (r *noiseReducer) trimHistory() {
 	if keepFrom > len(r.histBuf) {
 		keepFrom = len(r.histBuf)
 	}
+	if keepFrom > len(r.rawBuf) {
+		keepFrom = len(r.rawBuf)
+	}
 	n := copy(r.histBuf, r.histBuf[keepFrom:])
 	r.histBuf = r.histBuf[:n]
+	n = copy(r.rawBuf, r.rawBuf[keepFrom:])
+	r.rawBuf = r.rawBuf[:n]
 	r.histBase += keepFrom
-	_ = frame
 }
 
 // frameGate decides whether a frame at the given raw level (dBFS) carries any
@@ -638,45 +646,113 @@ func (r *noiseReducer) feedFloor(p float64) {
 	}
 }
 
-// trackBlock folds one delayed block's amplitude spectrum into the running
-// per-bin minimum.
+// trackBlock folds one analysis-aligned window into the event-aware noise floor.
+//
+// A bin whose smoothed power is well above the floor is a tone or a short
+// event: it is left out of the update so a beep is not learned as ambience. A
+// rise that lights up more than a third of the bins for ~200 ms is a scene
+// change and is mixed into the floor. Everything else creeps toward the
+// smoothed power.
 func (r *noiseReducer) trackBlock() {
 	r.plan.spectrum(r.binPow, r.block)
 	bins := r.plan.n/2 + 1
-	off := r.histNext * bins
+	hot := 0
 	for b := 0; b < bins; b++ {
-		r.hist[off+b] = math.Sqrt(r.binPow[b])
-	}
-	r.histNext = (r.histNext + 1) % r.p.TrackFrames
-	if r.histFill < r.p.TrackFrames {
-		r.histFill++
+		p := r.binPow[b]
+		r.track[b] = (1-noiseTrackFast)*r.track[b] + noiseTrackFast*p
+		if r.noiseReady && r.track[b] > r.noise[b]*noiseHotRatio {
+			hot++
+		}
 	}
 
-	// Minimum over the history in the POWER domain, then a rise limiter: the
-	// estimate may fall to a new minimum at once (that is a transient-free
-	// moment) but only creeps upwards, so one quiet frame cannot whip the
-	// subtraction up and down. The bias factor is applied to the measured
-	// minimum before smoothing, so the smoothed value is an estimate of the mean
-	// bin power rather than of its minimum.
-	frames := r.histFill
+	if !r.noiseReady {
+		for b := 0; b < bins; b++ {
+			r.noise[b] += r.binPow[b]
+		}
+		r.initCount++
+		if r.initCount >= r.initNeed {
+			scale := 1 / float64(r.initNeed)
+			var total float64
+			for b := 0; b < bins; b++ {
+				r.noise[b] *= scale
+				total += r.noise[b]
+			}
+			r.totalNoise = total
+			r.noiseReady = true
+		}
+		return
+	}
+
+	if hot > bins/noiseBroadFrac {
+		r.broadRun++
+	} else {
+		r.broadRun = 0
+	}
+	broad := r.broadRun >= r.broadNeed
+
 	var total float64
 	for b := 0; b < bins; b++ {
-		minAmp := math.Inf(1)
-		for f := 0; f < frames; f++ {
-			if v := r.hist[f*bins+b]; v < minAmp {
-				minAmp = v
-			}
-		}
-		p := minAmp * minAmp * r.p.BiasCorrect
-		if p > r.noise[b] {
-			// ~500 ms time constant at a 512-sample (10.7 ms) hop.
-			r.noise[b] += 0.021 * (p - r.noise[b])
-		} else {
-			r.noise[b] = p
+		switch {
+		case broad:
+			r.noise[b] = (1-noiseSceneMix)*r.noise[b] + noiseSceneMix*r.track[b]
+		case r.track[b] > r.noise[b]*noiseEventRatio:
+			// Narrow or short event: do not teach it to the noise floor.
+		default:
+			r.noise[b] = (1-noiseTrackSlow)*r.noise[b] + noiseTrackSlow*r.track[b]
 		}
 		total += r.noise[b]
 	}
 	r.totalNoise = total
+}
+
+// feedFrameEnergy looks at ~10 ms of the ORIGINAL audio ending at the current
+// analysis frame (the listening demo's paste-back also used the raw waveform;
+// the high-pass would otherwise strip the click's envelope and hide it).
+func (r *noiseReducer) feedFrameEnergy(start, end int) bool {
+	if end <= start {
+		return false
+	}
+	win := r.energyWin
+	if win > end-start {
+		win = end - start
+	}
+	seg := end - win
+	if seg < r.histBase {
+		return false
+	}
+	off := seg - r.histBase
+	if off < 0 || off+win > len(r.rawBuf) {
+		return false
+	}
+	var e float64
+	for i := 0; i < win; i++ {
+		x := float64(r.rawBuf[off+i])
+		e += x * x
+	}
+	e /= float64(win)
+	r.lastEnergy = e
+	return r.feedEnergy(e)
+}
+
+// feedEnergy updates the time-domain energy floor and reports whether this hop
+// is a short transient that should skip Wiener gain.
+func (r *noiseReducer) feedEnergy(e float64) bool {
+	if !r.energyPrimed {
+		r.energyFloor = e
+		r.energyPrimed = true
+		return false
+	}
+	if r.energyFloor > 0 && e > r.energyFloor*transientRatio {
+		r.energyRuns++
+		if r.energyRuns <= transientMaxHops {
+			return true
+		}
+		r.energyFloor = (1-transientFloorFast)*r.energyFloor + transientFloorFast*e
+		return false
+	}
+	r.energyRuns = 0
+	r.energyFloor = (1-transientFloorSlow)*r.energyFloor + transientFloorSlow*e
+	return false
 }
 
 // apply attenuates one frame's one-sided power spectrum by a per-bin Wiener
@@ -702,8 +778,17 @@ func (r *noiseReducer) trackBlock() {
 // are pushed to the floor). The floor is a gain, not a fraction of the power, so
 // it still lets a hopeless bin fall far below the signal bins - which is what
 // removes the noise's spectral shape from the normalised patch.
+//
+// Gain rises immediately (keeps onsets) and falls with a one-pole release, the
+// same attack/release the listening demo used. A short transient skips the gain
+// entirely so a click is not erased.
 func (r *noiseReducer) apply(pow []float64) {
-	if !r.spectral() || r.histFill == 0 || r.totalNoise <= 0 {
+	if !r.spectral() || !r.noiseReady || r.totalNoise <= 0 {
+		r.lastCutDB = 0
+		return
+	}
+	if r.protectFrame {
+		r.lastCutDB = 0
 		return
 	}
 	alpha, mix := r.p.OverSubtract, r.p.Mix
@@ -712,6 +797,7 @@ func (r *noiseReducer) apply(pow []float64) {
 	if bins > len(r.noise) {
 		bins = len(r.noise)
 	}
+	var pre, post float64
 	for b := 0; b < bins; b++ {
 		p := pow[b]
 		if p <= 0 {
@@ -725,8 +811,30 @@ func (r *noiseReducer) apply(pow []float64) {
 		if mix < 1 {
 			g = mix*g + (1 - mix)
 		}
-		pow[b] = p * g
+		if g > r.gainMem[b] {
+			r.gainMem[b] = g
+		} else {
+			r.gainMem[b] = gainReleasePrev*r.gainMem[b] + (1-gainReleasePrev)*g
+		}
+		applied := r.gainMem[b]
+		pow[b] = p * applied
+		pre += p
+		post += p * applied
 	}
+	if pre > 0 && post > 0 && post < pre {
+		r.lastCutDB = 10 * math.Log10(pre/post)
+	} else {
+		r.lastCutDB = 0
+	}
+}
+
+// ReductionDB reports how many dB the latest analysed frame was attenuated
+// across the whole spectrum. It is a meter reading, not part of the fingerprint.
+func (r *noiseReducer) ReductionDB() float64 {
+	if r == nil || r.lastCutDB < 0 {
+		return 0
+	}
+	return r.lastCutDB
 }
 
 // reset clears the streaming state.
@@ -736,19 +844,30 @@ func (r *noiseReducer) reset() {
 	}
 	r.hp.reset()
 	r.histBuf = r.histBuf[:0]
+	r.rawBuf = r.rawBuf[:0]
 	r.histBase = 0
 	r.histEnd = 0
 	r.winStart = 0
 	r.out = r.out[:0]
-	r.histFill = 0
-	r.histNext = 0
-	for i := range r.hist {
-		r.hist[i] = 0
+	for i := range r.track {
+		r.track[i] = 0
 	}
 	for i := range r.noise {
 		r.noise[i] = 0
 	}
+	for i := range r.gainMem {
+		r.gainMem[i] = 0
+	}
 	r.totalNoise = 0
+	r.noiseReady = false
+	r.initCount = 0
+	r.broadRun = 0
+	r.energyFloor = 0
+	r.energyRuns = 0
+	r.energyPrimed = false
+	r.protectFrame = false
+	r.lastEnergy = 0
+	r.lastCutDB = 0
 	r.frames = 0
 	r.floor = 0
 	r.peak = 0

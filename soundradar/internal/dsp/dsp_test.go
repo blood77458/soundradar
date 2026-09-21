@@ -630,6 +630,39 @@ func TestLevelDBFS(t *testing.T) {
 	}
 }
 
+func TestWindowLevelHoldsShortClick(t *testing.T) {
+	p := DefaultParams()
+	a, err := NewAnalyzer(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A short click sits in the middle of a quiet bed. By the time 120 ms of
+	// bed has followed it, the 50 ms meter has forgotten the click, but the
+	// 187 ms feature window still contains it.
+	const sr = 48000
+	bed := sine(int(0.30*sr), sr, 1000, dbAmp(-54))
+	click := sine(int(0.02*sr), sr, 1000, dbAmp(-28))
+	tail := sine(int(0.12*sr), sr, 1000, dbAmp(-54))
+	a.Push(bed)
+	a.Push(click)
+	a.Push(tail)
+	lv, win, gate := a.LevelDBFS(), a.WindowLevelDBFS(), a.GateDBFS(-60)
+	t.Logf("level %.1f window %.1f gate %.1f", lv, win, gate)
+	if lv >= gate {
+		t.Fatalf("尾部电平 %.1f 仍在门限 %.1f 之上，这个用例没有复现短促声被漏计", lv, gate)
+	}
+	if win <= gate {
+		t.Fatalf("特征窗电平 %.1f 没有留在门限 %.1f 之上", win, gate)
+	}
+	if win < lv+10 {
+		t.Fatalf("特征窗电平 %.1f 应当明显高于尾部电平 %.1f", win, lv)
+	}
+}
+
+func dbAmp(dbfs float64) float64 {
+	return math.Pow(10, dbfs/20) * math.Sqrt2
+}
+
 func TestFramesOffline(t *testing.T) {
 	p := DefaultParams()
 	const n = 24000 // 0.5 s, not a whole number of hops

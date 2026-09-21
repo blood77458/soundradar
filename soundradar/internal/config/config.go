@@ -133,10 +133,10 @@ type RecallConfig struct {
 //
 // It exists because the same sound heard through game ambience does not look
 // like the same sound recorded in a quiet moment: the ambience lifts the quiet
-// mel bands and the cosine score drops. The filter measures the stationary
-// ambience of the last ~256 ms, attenuates every frequency bin by its own
-// signal-to-noise ratio, and can raise the silence gate above the measured
-// noise floor.
+// mel bands and the cosine score drops. The filter tracks a per-bin noise
+// floor (skipping tones and short events, learning a ~200 ms broadband scene
+// change), attenuates every frequency bin by its own signal-to-noise ratio,
+// and can raise the silence gate above the measured noise floor.
 //
 // These values are part of the FINGERPRINT (see internal/dsp): changing any of
 // them changes every stored vector, so the index is rebuilt automatically the

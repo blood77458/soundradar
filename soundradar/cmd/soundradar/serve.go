@@ -299,8 +299,8 @@ func runServe(args []string) error {
 	if *withTray {
 		panelURL := url
 		trayIcon, err = newServeTray(trayOptions{
-			PanelURL:     panelURL,
-			DataDir:      filepath.Dir(cfgFile),
+			PanelURL: panelURL,
+			DataDir:  filepath.Dir(cfgFile),
 			CandidatesDir: func() string {
 				if d, derr := config.ResolveRecallDir(cfg.Recall.Dir); derr == nil {
 					return d
@@ -361,8 +361,9 @@ func openURL(url string) error {
 	switch runtime.GOOS {
 	case "windows":
 		// `cmd /c start` needs an empty title argument so that a quoted URL is
-		// not mistaken for the window title.
-		return exec.Command("cmd", "/c", "start", "", url).Start()
+		// not mistaken for the window title. startBreakaway keeps that cmd.exe
+		// (and the browser it launches) out of the tray's kill-on-close job.
+		return startBreakaway("cmd", "/c", "start", "", url).Start()
 	case "darwin":
 		return exec.Command("open", url).Start()
 	default:

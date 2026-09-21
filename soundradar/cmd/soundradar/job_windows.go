@@ -5,14 +5,11 @@ package main
 import (
 	"os/exec"
 	"sync"
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
-
-// jobObjectLimitKillOnJobClose makes a job object kill its processes when the
-// last handle to it closes, i.e. when this process exits - gracefully or not.
-const jobObjectLimitKillOnJobClose = 0x00002000
 
 type ioCounters struct {
 	ReadOperationCount  uint64
@@ -68,7 +65,14 @@ func adoptChild(cmd *exec.Cmd) {
 			return
 		}
 		var info jobObjectExtendedLimitInformationStruct
-		info.BasicLimitInformation.LimitFlags = jobObjectLimitKillOnJobClose
+		// KILL_ON_JOB_CLOSE reaps the serve child if the tray is killed.
+		// BREAKAWAY_OK / SILENT_BREAKAWAY_OK keep anything that child starts
+		// (the browser opened for the management page) out of the job. Without
+		// that, quitting SoundRadar TerminateProcess's Chrome, and Chrome
+		// reports it as a crash.
+		info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
+			windows.JOB_OBJECT_LIMIT_BREAKAWAY_OK |
+			windows.JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK
 		_, err = windows.SetInformationJobObject(h,
 			windows.JobObjectExtendedLimitInformation,
 			uintptr(unsafe.Pointer(&info)),
@@ -91,4 +95,15 @@ func adoptChild(cmd *exec.Cmd) {
 	}
 	defer windows.CloseHandle(ph)
 	_ = windows.AssignProcessToJobObject(jobHand, ph)
+}
+
+// startBreakaway starts a process that must outlive this one. serve is a
+// member of the tray's kill-on-close job; an ordinary child (cmd.exe opening
+// the default browser) would be killed with that job.
+func startBreakaway(name string, args ...string) *exec.Cmd {
+	cmd := exec.Command(name, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		CreationFlags: windows.CREATE_BREAKAWAY_FROM_JOB,
+	}
+	return cmd
 }

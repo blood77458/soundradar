@@ -114,7 +114,7 @@
 
           <div class="field">
             <label>格子对照（同音类 · 可选）</label>
-            <div class="hint">一行：格子 WxH + 可能物品名。命中后面板/悬浮窗会拼成「类名｜3×2 泥板 / 2×2 理想国」。</div>
+            <div class="hint">每行一张对照图 + 格子 WxH + 物品名。命中后按格子格式分组展示，不会全部挤在一行。</div>
             <div id="cHints" class="hintRows"></div>
             <button type="button" class="btn" id="btnAddCHint">＋ 增加一行</button>
           </div>
@@ -174,7 +174,7 @@
         </div>
         <div class="field">
           <label>格子对照（同音类 · 可选）</label>
-          <div class="hint">仅展示用，不参与指纹；改提示无需重建索引。</div>
+          <div class="hint">每行可单独上传对照图。仅展示用，不参与指纹；改提示无需重建索引。</div>
           <div id="dHints" class="hintRows"></div>
           <button type="button" class="btn" id="btnAddDHint">＋ 增加一行</button>
         </div>
@@ -248,6 +248,13 @@
             <div class="meterPeak" id="levelPeak"></div>
             <div class="meterGate" id="levelGate" title="静音门限"></div>
           </div>
+          <div class="levelHead levelSub">
+            <span>去噪后电平</span>
+            <span class="mono" id="denoisedText">— dBFS</span>
+          </div>
+          <div class="meter meterSub" id="denoisedMeter">
+            <div class="meterFill meterFillSub" id="denoisedFill"></div>
+          </div>
           <div class="levelScale"><span>-60</span><span>-40</span><span>-20</span><span>0 dBFS</span></div>
         </div>
         <div class="liveStats mono" id="liveStats">—</div>
@@ -256,7 +263,7 @@
 
       <div class="panel" id="hitGuessPanel">
         <h2>识别对照（格子 → 可能物品）</h2>
-        <div class="hint">命中同音类后，在此查看格子尺寸与对应物品图。唯一类会显示单行。</div>
+        <div class="hint">命中同音类后，按格子格式分组：同一尺寸一行，不同尺寸分行。唯一类会显示单行。</div>
         <div id="hitGuess" class="hitGuess empty">还没有命中。点上面的「开始」，在游戏里制造声音。</div>
       </div>
 
@@ -422,7 +429,7 @@
             <label class="check"><input type="checkbox" id="setShowAll" /> 全部展示格子对照</label>
           </div>
         </div>
-        <div class="hint">默认关闭：悬浮窗仍是现在的单行命中。打开后，一次命中会铺开该类的全部格子，每格是图片，底部是格子数和名称（与实时页「识别对照」相同）。</div>
+        <div class="hint">默认关闭：悬浮窗仍是现在的单行命中。打开后，一次命中会按格子格式分组铺开（同一尺寸一行），每格是图片和名称。</div>
       </div>
 
       <div class="panel">
@@ -498,7 +505,7 @@
             <span class="status" id="setNoiseStatus"></span>
           </div>
         </div>
-        <div class="hint">针对游戏房间底噪：高通建议 200–300 Hz，强度 2–3。保存后会按新参数自动重建索引；若正在实时识别，请先停再开一次。</div>
+        <div class="hint">针对游戏房间底噪：默认高通 120 Hz、强度 1.5、单频下限 -8 dB。保存后会按新参数自动重建索引；若正在实时识别，请先停再开一次。</div>
         <div class="mono stateLine" id="setNoiseState">—</div>
       </div>
 

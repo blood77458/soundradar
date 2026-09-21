@@ -1,6 +1,6 @@
 // Package dsp computes the soundradar P2 acoustic fingerprint.
 //
-// # Feature pipeline ("mel-goertzel-v1", FFT variant)
+// # Feature pipeline ("mel-goertzel-v2", FFT variant)
 //
 // Input is always 48 kHz / mono / float32 in [-1, 1] (the canonical rate of
 // internal/library, so no resampling happens anywhere on the recognition path).
@@ -57,11 +57,13 @@ const (
 	// v2 added the environment-noise front-end (noise.go), which changes every
 	// produced vector, so it is a NEW algorithm name rather than a new version:
 	// an index built by v1 is refused with a readable message instead of being
-	// searched with mismatched vectors.
+	// searched with mismatched vectors. v3 (this Version) replaced the
+	// minimum-statistics estimator with event-aware tracking; same algorithm
+	// family, different numbers, so LoadOrBuild rebuilds.
 	Algorithm = "mel-goertzel-v2"
 	// Version is the fingerprint implementation version, bumped on any change
 	// that alters the produced numbers.
-	Version = 2
+	Version = 3
 	// Norm describes the patch post-processing; it is stored in the index so a
 	// mismatch is detected as clearly as a parameter mismatch.
 	Norm = "mean-subtract+l2"
@@ -267,7 +269,6 @@ type noiseDoc struct {
 	OverSubtract  float64 `json:"overSubtract"`
 	GainFloorDB   float64 `json:"gainFloorDb"`
 	Mix           float64 `json:"mix"`
-	TrackFrames   int     `json:"trackFrames"`
 	AdaptiveGate  bool    `json:"adaptiveGate"`
 	GateMarginDB  float64 `json:"gateMarginDb"`
 	GateFloorDBFS float64 `json:"gateFloorDbfs"`
@@ -282,7 +283,6 @@ func noiseParamsDoc(n NoiseParams) noiseDoc {
 		OverSubtract:  math.Round(n.OverSubtract*1000) / 1000,
 		GainFloorDB:   math.Round(n.GainFloorDB*1000) / 1000,
 		Mix:           math.Round(n.Mix*1000) / 1000,
-		TrackFrames:   n.TrackFrames,
 		AdaptiveGate:  n.AdaptiveGate,
 		GateMarginDB:  math.Round(n.GateMarginDB*1000) / 1000,
 		GateFloorDBFS: math.Round(n.GateFloorDBFS*1000) / 1000,
@@ -768,8 +768,8 @@ type Analyzer struct {
 	power  []float64
 
 	// noise is the environment-noise front-end (noise.go). It is created from
-	// Params.Noise and, when active, filters every sample in Push and subtracts
-	// the tracked noise floor from every frame's power spectrum in emitFrameAt.
+	// Params.Noise and, when active, filters every sample in Push and applies
+	// a per-bin Wiener gain to every frame's power spectrum in emitFrameAt.
 	// It is deliberately applied to templates (index build) and live audio
 	// alike, so both sides of the comparison see the same processing.
 	noise *noiseReducer
@@ -984,9 +984,9 @@ func (a *Analyzer) Push(pcm []float32) {
 		a.stot++
 		a.ltot++
 		// A frame ending at sample stot-1 starts at stot-FrameSize. The noise
-		// estimator is advanced to this frame's END first, so the attenuation
-		// it applies was built from audio that is at least one frame older than
-		// the frame itself (see noiseReducer.AdvanceTo).
+		// estimator is advanced to this frame's END first so the last tracker
+		// window is this same frame; event bins are not written into the floor
+		// (see noiseReducer.AdvanceTo).
 		if off := a.stot - int64(p.FrameSize); off >= 0 && off%int64(p.HopSize) == 0 {
 			a.noise.AdvanceTo(int(a.stot))
 			a.emitFrameAt(off)
@@ -1052,9 +1052,9 @@ func (a *Analyzer) emitFrameAt(start int64) {
 		a.wframe[i] = a.demean[i] * a.win[i]
 	}
 	a.plan.spectrum(a.power, a.wframe)
-	// Environment-noise reduction: attenuate the tracked stationary noise power
-	// before the mel bank integrates it. Inactive (and a single branch) when the
-	// front-end is off or has no estimate yet.
+	// Environment-noise reduction: Wiener-attenuate the tracked stationary
+	// noise power before the mel bank integrates it. Inactive (and a single
+	// branch) when the front-end is off or has no estimate yet.
 	a.noise.apply(a.power)
 
 	melRaw := make([]float64, p.MelBands)
@@ -1148,6 +1148,33 @@ func (a *Analyzer) FrameEnergy() ([]float64, int) {
 	return out, int(a.rbase)
 }
 
+// WindowLevelDBFS is the loudest analysis frame still inside the current
+// feature window, in dBFS. LevelDBFS only covers the last ~50 ms, while a
+// patch spans ~187 ms, so a short click has already fallen back into the bed
+// by the time the patch is centred on it. The realtime matcher uses this
+// (alongside LevelDBFS) so that aligned window is still scored. Digital
+// silence maps to -Inf. The value is measured on the audio as received, before
+// the noise front-end.
+func (a *Analyzer) WindowLevelDBFS() float64 {
+	if len(a.rawEnergy) == 0 {
+		return math.Inf(-1)
+	}
+	n := a.p.WindowFrames
+	if n > len(a.rawEnergy) {
+		n = len(a.rawEnergy)
+	}
+	maxSq := 0.0
+	for i := len(a.rawEnergy) - n; i < len(a.rawEnergy); i++ {
+		if a.rawEnergy[i] > maxSq {
+			maxSq = a.rawEnergy[i]
+		}
+	}
+	if maxSq <= 0 {
+		return math.Inf(-1)
+	}
+	return 10 * math.Log10(maxSq)
+}
+
 // LevelDBFS returns the RMS level of roughly the last 50 ms (2400 samples) in
 // dBFS, i.e. 20*log10(rms). Digital silence maps to -Inf.
 func (a *Analyzer) LevelDBFS() float64 {
@@ -1168,6 +1195,19 @@ func (a *Analyzer) LevelDBFS() float64 {
 		return math.Inf(-1)
 	}
 	return 20 * math.Log10(rms)
+}
+
+// DenoisedLevelDBFS is LevelDBFS after the latest frame's broadband Wiener
+// attenuation. It uses the same 50 ms window as LevelDBFS, shifted down by how
+// many dB the noise gain removed. A short click that skips the gain reads the
+// same as LevelDBFS. The value is for the live meter only; it is not part of
+// the fingerprint.
+func (a *Analyzer) DenoisedLevelDBFS() float64 {
+	lv := a.LevelDBFS()
+	if math.IsInf(lv, 0) || a.noise == nil {
+		return lv
+	}
+	return lv - a.noise.ReductionDB()
 }
 
 // NoiseFloorDBFS returns the tracked environment-noise floor in dBFS, or -Inf

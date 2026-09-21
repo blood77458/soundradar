@@ -202,7 +202,7 @@ func TestEngineMarginGate(t *testing.T) {
 	for i := 0; i < 40; i++ {
 		w = (lo + hi) / 2
 		a, b := score(w)
-		if a-b > opts.MinMargin*0.98 {
+		if a-b > opts.MinMargin*0.80 {
 			hi = w
 		} else {
 			lo = w

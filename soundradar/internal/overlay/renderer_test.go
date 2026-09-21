@@ -683,3 +683,42 @@ func TestFitStringNeverOverflows(t *testing.T) {
 	}
 	t.Logf("fitString(%q, %d) = %q（宽 %d px）", long, maxW, got, int(d.MeasureString(got).Round()))
 }
+
+func TestCardLayoutGroupsByGrid(t *testing.T) {
+	items := []DisplayItem{
+		{Name: "泥板", Grid: "3×2"},
+		{Name: "理想国", Grid: "2x2"},
+		{Name: "泥板·仿", Grid: "3x2"},
+		{Name: "方印", Grid: "2×2"},
+	}
+	groups := groupCardsByGrid(items)
+	if len(groups) != 2 {
+		t.Fatalf("组数 = %d，期望 2（3x2 一行、2x2 一行）", len(groups))
+	}
+	if len(groups[0]) != 2 || gridGroupKey(groups[0][0].Grid) != "3x2" {
+		t.Fatalf("第一组应为 3x2，实际 %+v", groups[0])
+	}
+	if len(groups[1]) != 2 || gridGroupKey(groups[1][0].Grid) != "2x2" {
+		t.Fatalf("第二组应为 2x2，实际 %+v", groups[1])
+	}
+	cols, rows := cardLayoutSize(items)
+	if cols != 2 || rows != 2 {
+		t.Fatalf("布局 = %d×%d，期望 2 列 2 行（按格式分行，而不是 4 张挤一行）", cols, rows)
+	}
+	gw, gh := CardCanvasGrouped(96, items)
+	flatW, flatH := CardCanvas(96, len(items))
+	if gw >= flatW {
+		t.Fatalf("分组画布宽 %d 应窄于全部挤一行的 %d", gw, flatW)
+	}
+	if gh <= flatH {
+		t.Fatalf("分组画布高 %d 应高于全部挤一行的 %d", gh, flatH)
+	}
+
+	r := newTestRenderer(t, RenderOptions{
+		Width: gw, Height: gh, IconSize: 96, CardLayout: true, Alpha: 1,
+	})
+	img := r.Draw(items, 0)
+	if img.Bounds().Dx() != gw || img.Bounds().Dy() != gh {
+		t.Fatalf("画布 %dx%d，期望 %dx%d", img.Bounds().Dx(), img.Bounds().Dy(), gw, gh)
+	}
+}

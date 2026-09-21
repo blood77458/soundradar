@@ -53,7 +53,7 @@ var (
 	buildTime = "unknown"
 )
 
-const versionNumber = "0.7.2-p5"
+const versionNumber = "0.7.3-p5"
 
 const usage = `soundradar - game sound recognition assistant
 

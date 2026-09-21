@@ -29,6 +29,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 
 	xdraw "golang.org/x/image/draw"
 	"golang.org/x/image/font"
@@ -50,7 +51,8 @@ type RenderOptions struct {
 	ShowName  bool
 	ShowScore bool
 	// CardLayout draws each item as a tile: icon on top, grid size and name
-	// underneath. Width/Height must be CardCanvas(IconSize, n).
+	// underneath. Width/Height must be CardCanvasGrouped(IconSize, items)
+	// (one row per grid format).
 	CardLayout bool
 	// Alpha is the global opacity 0..1 applied to every pixel of the canvas
 	// (this is what fade in/out animates).
@@ -336,7 +338,8 @@ func (r *Renderer) Draw(items []DisplayItem, frame int) *image.RGBA {
 	return canvas
 }
 
-// cardColMax is how many hint tiles share one row before wrapping.
+// cardColMax is how many hint tiles of the same grid format share one row
+// before wrapping. Different formats always start a new row.
 const cardColMax = 8
 
 func cardGrid(n int) (cols, rows int) {
@@ -349,6 +352,45 @@ func cardGrid(n int) (cols, rows int) {
 	}
 	rows = (n + cols - 1) / cols
 	return cols, rows
+}
+
+func gridGroupKey(g string) string {
+	g = strings.ToLower(strings.TrimSpace(g))
+	g = strings.ReplaceAll(g, "×", "x")
+	g = strings.ReplaceAll(g, " ", "")
+	return g
+}
+
+func groupCardsByGrid(items []DisplayItem) [][]DisplayItem {
+	index := map[string]int{}
+	var groups [][]DisplayItem
+	for _, it := range items {
+		key := gridGroupKey(it.Grid)
+		if i, ok := index[key]; ok {
+			groups[i] = append(groups[i], it)
+			continue
+		}
+		index[key] = len(groups)
+		groups = append(groups, []DisplayItem{it})
+	}
+	return groups
+}
+
+func cardLayoutSize(items []DisplayItem) (cols, rows int) {
+	groups := groupCardsByGrid(items)
+	if len(groups) == 0 {
+		return 1, 1
+	}
+	maxCols := 1
+	totalRows := 0
+	for _, g := range groups {
+		c, r := cardGrid(len(g))
+		if c > maxCols {
+			maxCols = c
+		}
+		totalRows += r
+	}
+	return maxCols, totalRows
 }
 
 func cardGap(icon int) int {
@@ -373,12 +415,16 @@ func cardTextBlock(icon int) int {
 	return h
 }
 
-// CardCanvas is the window size for n hint tiles at the given icon size.
-func CardCanvas(icon, n int) (w, h int) {
+func cardCanvasSize(icon, cols, rows int) (w, h int) {
 	if icon < 48 {
 		icon = 48
 	}
-	cols, rows := cardGrid(n)
+	if cols < 1 {
+		cols = 1
+	}
+	if rows < 1 {
+		rows = 1
+	}
 	gap := cardGap(icon)
 	tb := cardTextBlock(icon)
 	w = cols*icon + (cols+1)*gap + 2*spacingPad
@@ -386,7 +432,21 @@ func CardCanvas(icon, n int) (w, h int) {
 	return w, h
 }
 
-// drawCards paints hint tiles: picture, then grid size and name underneath.
+// CardCanvas is the window size for n hint tiles of a single grid format.
+func CardCanvas(icon, n int) (w, h int) {
+	cols, rows := cardGrid(n)
+	return cardCanvasSize(icon, cols, rows)
+}
+
+// CardCanvasGrouped is the window size when tiles are grouped by grid format
+// (one row per format, wrapping only within the same format).
+func CardCanvasGrouped(icon int, items []DisplayItem) (w, h int) {
+	cols, rows := cardLayoutSize(items)
+	return cardCanvasSize(icon, cols, rows)
+}
+
+// drawCards paints hint tiles grouped by grid format: same size on one row,
+// a new format starts a new row. Picture, then grid size and name underneath.
 func (r *Renderer) drawCards(items []DisplayItem) *image.RGBA {
 	o := r.opt
 	canvas := image.NewRGBA(image.Rect(0, 0, o.Width, o.Height))
@@ -398,15 +458,19 @@ func (r *Renderer) drawCards(items []DisplayItem) *image.RGBA {
 	if icon < 48 {
 		icon = 48
 	}
-	cols, _ := cardGrid(len(items))
 	gap := cardGap(icon)
 	tb := cardTextBlock(icon)
-	for i := range items {
-		c := i % cols
-		row := i / cols
-		x := spacingPad + gap + c*(icon+gap)
-		y := spacingPad + gap + row*(icon+tb+gap)
-		r.drawCard(canvas, items[i], x, y, icon, tb)
+	row := 0
+	for _, g := range groupCardsByGrid(items) {
+		gCols, gRows := cardGrid(len(g))
+		for i, it := range g {
+			c := i % gCols
+			rr := row + i/gCols
+			x := spacingPad + gap + c*(icon+gap)
+			y := spacingPad + gap + rr*(icon+tb+gap)
+			r.drawCard(canvas, it, x, y, icon, tb)
+		}
+		row += gRows
 	}
 	applyAlpha(canvas, o.Alpha)
 	return canvas

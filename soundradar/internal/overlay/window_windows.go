@@ -272,6 +272,12 @@ type Overlay struct {
 	lastErr  string
 	renderer *Renderer
 	alpha    float64
+	// idlePresented is set once an empty, fully transparent frame has been
+	// handed to the compositor. Further timer ticks must not call
+	// UpdateLayeredWindow: a topmost layered window refreshed at 50 fps forces
+	// DWM to recomposite even when nothing is on screen, which stutters the
+	// desktop and games.
+	idlePresented bool
 
 	// hwnd is published by the window thread once CreateWindowExW returns.
 	hwnd     atomic.Uint64
@@ -303,8 +309,11 @@ type Overlay struct {
 	frames atomic.Int64
 
 	// cardN is how many hint tiles the current hit expanded into. 0 means the
-	// compact one-line overlay (the default).
-	cardN int
+	// compact one-line overlay (the default). cardCols/cardRows is the grouped
+	// layout (one row per grid format) used to size the window.
+	cardN    int
+	cardCols int
+	cardRows int
 }
 
 // New creates the overlay window and starts its message loop.
@@ -373,7 +382,7 @@ func (o *Overlay) Show(it DisplayItem) error {
 	}
 	o.mu.Lock()
 	wasCards := o.cardN > 0
-	o.cardN = 0
+	o.clearCardsLocked()
 	maxN := o.cfg.MaxSimultaneous
 	o.mu.Unlock()
 	if wasCards {
@@ -394,7 +403,7 @@ func (o *Overlay) Show(it DisplayItem) error {
 }
 
 // ShowCards replaces the overlay with one tile per grid hint. The window grows
-// to fit them and shrinks again on the next compact Show.
+// to fit them (grouped by grid format) and shrinks again on the next compact Show.
 func (o *Overlay) ShowCards(items []DisplayItem) error {
 	if o == nil {
 		return errors.New("悬浮窗未创建")
@@ -413,6 +422,7 @@ func (o *Overlay) ShowCards(items []DisplayItem) error {
 	}
 	o.mu.Lock()
 	o.cardN = len(items)
+	o.cardCols, o.cardRows = cardLayoutSize(items)
 	o.mu.Unlock()
 	o.queue.Replace(items)
 	hwnd := windows.Handle(o.hwnd.Load())
@@ -426,6 +436,12 @@ func (o *Overlay) ShowCards(items []DisplayItem) error {
 		return fmt.Errorf("通知窗口线程失败: %w", err)
 	}
 	return nil
+}
+
+func (o *Overlay) clearCardsLocked() {
+	o.cardN = 0
+	o.cardCols = 0
+	o.cardRows = 0
 }
 
 // ApplyConfig hot-applies a new overlay configuration: position, size, opacity,
@@ -448,7 +464,7 @@ func (o *Overlay) ApplyConfig(cfg config.OverlayConfig) error {
 	o.queue.SetMax(cfg.MaxSimultaneous)
 	if !cfg.ShowAll {
 		o.mu.Lock()
-		o.cardN = 0
+		o.clearCardsLocked()
 		o.mu.Unlock()
 	}
 
@@ -861,13 +877,18 @@ func (o *Overlay) geometry() (x, y, w, h int, err error) {
 	o.mu.Lock()
 	cfg := o.cfg
 	n := o.cardN
+	cols := o.cardCols
+	rows := o.cardRows
 	o.mu.Unlock()
 	if cfg.ShowAll && n > 0 {
 		size := cfg.Size
 		if size <= 0 {
 			size = 96
 		}
-		w, h = CardCanvas(size, n)
+		if cols < 1 || rows < 1 {
+			cols, rows = cardGrid(n)
+		}
+		w, h = cardCanvasSize(size, cols, rows)
 		x, y, err = config.ResolvePositionSized(cfg, Monitors(), w, h)
 		return x, y, w, h, err
 	}
@@ -935,8 +956,9 @@ func (o *Overlay) renderFrame() {
 	o.mu.Lock()
 	cfg := o.cfg
 	rend := o.renderer
+	hidden := !o.visible
 	o.mu.Unlock()
-	if rend == nil {
+	if rend == nil || hidden {
 		return
 	}
 
@@ -946,16 +968,25 @@ func (o *Overlay) renderFrame() {
 	if len(items) > 0 {
 		alpha = OverallAlpha(items, timing) * cfg.Opacity
 	}
+	clearing := len(items) == 0 && alpha == 0
+	o.mu.Lock()
+	if clearing && o.idlePresented {
+		o.mu.Unlock()
+		return
+	}
+	o.mu.Unlock()
 	rend.SetAlpha(alpha)
 	canvas := rend.Draw(items, int(o.frames.Load()))
+	shrunk := false
 	if len(items) == 0 {
 		o.mu.Lock()
 		shrink := o.cardN > 0
 		if shrink {
-			o.cardN = 0
+			o.clearCardsLocked()
 		}
 		o.mu.Unlock()
 		if shrink {
+			shrunk = true
 			o.applyGeometry()
 		}
 	}
@@ -963,6 +994,12 @@ func (o *Overlay) renderFrame() {
 		o.setErr(err)
 		return
 	}
+	o.mu.Lock()
+	// A shrink changes the renderer size after this canvas was drawn. Leave
+	// idle unset so the next tick presents one correctly sized empty frame
+	// and only then stops talking to the compositor.
+	o.idlePresented = clearing && !shrunk
+	o.mu.Unlock()
 	// 注意：早期版本在这里每帧调用 reassertGeometry() 去"修"被 UpdateLayeredWindow
 	// 写坏的窗口矩形。那其实是在给 blit 里传错 SIZE 打补丁；真正的根因（SIZE 被
 	// 打包成 uint32）修掉之后，ULW 不会再动窗口矩形，这段补丁已删除。
@@ -978,6 +1015,14 @@ func (o *Overlay) applyVisible(v bool) {
 	hwnd := windows.Handle(o.hwnd.Load())
 	if hwnd == 0 {
 		return
+	}
+	if v {
+		// The window may have been hidden mid-fade. Force one fresh frame so a
+		// stale card is not shown, and so an empty overlay does not stay on
+		// the 50 fps path.
+		o.mu.Lock()
+		o.idlePresented = false
+		o.mu.Unlock()
 	}
 	showWindow(hwnd, v)
 }

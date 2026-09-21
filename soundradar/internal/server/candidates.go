@@ -353,7 +353,7 @@ func (s *Server) handlePromote(w http.ResponseWriter, r *http.Request, sink Reca
 		writeStoreError(w, err)
 		return
 	}
-	req, iconPNG, err := readPromoteBody(r, s)
+	req, iconPNG, hintPNGs, err := readPromoteBody(r, s)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -395,6 +395,16 @@ func (s *Server) handlePromote(w http.ResponseWriter, r *http.Request, sink Reca
 		if err := s.store.AddItem(it, iconPNG, [][]byte{conv.WAV}); err != nil {
 			writeStoreError(w, err)
 			return
+		}
+		if len(hintPNGs) > 0 && len(it.DisplayHints) > 0 {
+			pngs := hintPNGs
+			if len(pngs) > len(it.DisplayHints) {
+				pngs = pngs[:len(it.DisplayHints)]
+			}
+			if _, err := s.store.SetHintIcons(it.ID, pngs); err != nil {
+				writeStoreError(w, err)
+				return
+			}
 		}
 		if err := s.store.Save(); err != nil {
 			writeError(w, http.StatusInternalServerError, "写库失败: "+err.Error())
@@ -479,20 +489,21 @@ func newRecallSample(conv *audio.Converted, cand recall.Candidate) library.Sampl
 // readPromoteBody accepts either application/json or multipart/form-data (so an
 // icon file can travel in the same request). A JSON "icon" string means
 // "borrow the icon of this existing item".
-func readPromoteBody(r *http.Request, s *Server) (promoteRequest, []byte, error) {
+func readPromoteBody(r *http.Request, s *Server) (promoteRequest, []byte, [][]byte, error) {
 	var req promoteRequest
 	var iconPNG []byte
+	var hintPNGs [][]byte
 	ct := r.Header.Get("Content-Type")
 
 	if strings.HasPrefix(ct, "multipart/form-data") {
 		if err := r.ParseMultipartForm(maxFormMemory); err != nil {
-			return req, nil, fmt.Errorf("无法解析 multipart 表单: %w", err)
+			return req, nil, nil, fmt.Errorf("无法解析 multipart 表单: %w", err)
 		}
 		defer r.MultipartForm.RemoveAll()
 
 		if v := strings.TrimSpace(r.FormValue("promote")); v != "" {
 			if err := json.Unmarshal([]byte(v), &req); err != nil {
-				return req, nil, fmt.Errorf("promote 字段不是合法 JSON: %w", err)
+				return req, nil, nil, fmt.Errorf("promote 字段不是合法 JSON: %w", err)
 			}
 		} else {
 			req.Name = r.FormValue("name")
@@ -519,22 +530,27 @@ func readPromoteBody(r *http.Request, s *Server) (promoteRequest, []byte, error)
 			defer f.Close()
 			raw, rerr := library.ReadAllLimited(f, maxIconBytes)
 			if rerr != nil {
-				return req, nil, fmt.Errorf("图标读取失败: %w", rerr)
+				return req, nil, nil, fmt.Errorf("图标读取失败: %w", rerr)
 			}
 			png, rerr := library.ScaleIconNamed(raw, hdr.Filename)
 			if rerr != nil {
-				return req, nil, rerr
+				return req, nil, nil, rerr
 			}
 			iconPNG = png
+		}
+		var herr error
+		hintPNGs, herr = readHintIconFiles(r)
+		if herr != nil {
+			return req, nil, nil, herr
 		}
 	} else {
 		body, err := readLimited(r, 1<<20)
 		if err != nil {
-			return req, nil, fmt.Errorf("读取请求体失败: %w", err)
+			return req, nil, nil, fmt.Errorf("读取请求体失败: %w", err)
 		}
 		if len(strings.TrimSpace(string(body))) > 0 {
 			if err := json.Unmarshal(body, &req); err != nil {
-				return req, nil, fmt.Errorf("JSON 解析失败: %w", err)
+				return req, nil, nil, fmt.Errorf("JSON 解析失败: %w", err)
 			}
 		}
 	}
@@ -543,12 +559,12 @@ func readPromoteBody(r *http.Request, s *Server) (promoteRequest, []byte, error)
 		if src := strings.TrimSpace(req.Icon); src != "" {
 			it := s.store.Get(src)
 			if it == nil {
-				return req, nil, fmt.Errorf("icon 指向的条目不存在: %s", src)
+				return req, nil, nil, fmt.Errorf("icon 指向的条目不存在: %s", src)
 			}
 			iconPNG = it.IconPNG()
 		}
 	}
-	return req, iconPNG, nil
+	return req, iconPNG, hintPNGs, nil
 }
 
 // handleRecallTrigger serves POST /api/recall/trigger: save "the last N

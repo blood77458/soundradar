@@ -62,8 +62,8 @@ type OverlayBridge interface {
 	State() any
 	// ShowHit enqueues one recognised hit (compact: one icon + one line).
 	ShowHit(id, name string, score float64)
-	// ShowCards replaces the overlay with one card per grid hint
-	// (picture, grid size, name). Used when overlay.showAll is on.
+	// ShowCards replaces the overlay with one card per grid hint, grouped by
+	// format (same WxH on one row). Used when overlay.showAll is on.
 	ShowCards(id string, score float64, cards []OverlayCard)
 }
 
@@ -640,6 +640,10 @@ func (s *Server) handleCreateItem(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
+	if err := s.applyHintIcons(r, it.ID, len(it.DisplayHints)); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if err := s.store.Save(); err != nil {
 		writeError(w, http.StatusInternalServerError, "写库失败: "+err.Error())
 		return
@@ -655,7 +659,7 @@ func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request, id string) 
 		writeError(w, http.StatusNotFound, "条目不存在: "+id)
 		return
 	}
-	body, iconRaw, iconName, err := readPatchBody(r)
+	body, iconRaw, iconName, hintPNGs, err := readPatchBody(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -725,6 +729,12 @@ func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request, id string) 
 	}
 	if newIcon != nil {
 		if updated, err = s.store.SetIcon(id, newIcon); err != nil {
+			writeStoreError(w, err)
+			return
+		}
+	}
+	if len(hintPNGs) > 0 {
+		if updated, err = s.store.SetHintIcons(id, hintPNGs); err != nil {
 			writeStoreError(w, err)
 			return
 		}
@@ -841,11 +851,11 @@ type patchFields struct {
 // readPatchBody accepts either application/json or multipart/form-data (the
 // latter so an icon can be replaced in the same request; the JSON document then
 // travels in the "patch" field).
-func readPatchBody(r *http.Request) (jsonBody []byte, icon []byte, iconName string, err error) {
+func readPatchBody(r *http.Request) (jsonBody []byte, icon []byte, iconName string, hintPNGs [][]byte, err error) {
 	ct := r.Header.Get("Content-Type")
 	if strings.HasPrefix(ct, "multipart/form-data") {
 		if err := r.ParseMultipartForm(maxFormMemory); err != nil {
-			return nil, nil, "", fmt.Errorf("无法解析 multipart 表单: %w", err)
+			return nil, nil, "", nil, fmt.Errorf("无法解析 multipart 表单: %w", err)
 		}
 		defer r.MultipartForm.RemoveAll()
 		if v := r.FormValue("patch"); v != "" {
@@ -882,18 +892,22 @@ func readPatchBody(r *http.Request) (jsonBody []byte, icon []byte, iconName stri
 			defer f.Close()
 			icon, err = library.ReadAllLimited(f, maxIconBytes)
 			if err != nil {
-				return nil, nil, "", fmt.Errorf("图标读取失败: %w", err)
+				return nil, nil, "", nil, fmt.Errorf("图标读取失败: %w", err)
 			}
 			iconName = hdr.Filename
 		}
-		return jsonBody, icon, iconName, nil
+		hintPNGs, err = readHintIconFiles(r)
+		if err != nil {
+			return nil, nil, "", nil, err
+		}
+		return jsonBody, icon, iconName, hintPNGs, nil
 	}
 
 	b, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
-		return nil, nil, "", fmt.Errorf("读取请求体失败: %w", err)
+		return nil, nil, "", nil, fmt.Errorf("读取请求体失败: %w", err)
 	}
-	return b, nil, "", nil
+	return b, nil, "", nil, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -902,20 +916,20 @@ func readPatchBody(r *http.Request) (jsonBody []byte, icon []byte, iconName stri
 
 // ItemDTO is the item summary returned inside the library listing.
 type ItemDTO struct {
-	ID           string                `json:"id"`
-	Name         string                `json:"name"`
-	Icon         string                `json:"icon"`
-	Threshold    float64               `json:"threshold"`
-	CooldownMs   int                   `json:"cooldownMs"`
-	Profile      string                `json:"profile"`
-	Tags         []string              `json:"tags"`
-	Note         string                `json:"note"`
-	DisplayHints []DisplayHintDTO     `json:"displayHints"`
-	SampleCount  int                   `json:"sampleCount"`
-	TotalLenS    float64               `json:"totalLenS"`
-	CreatedAt    time.Time             `json:"createdAt"`
-	UpdatedAt    time.Time             `json:"updatedAt"`
-	IconURL      string                `json:"iconUrl"`
+	ID           string           `json:"id"`
+	Name         string           `json:"name"`
+	Icon         string           `json:"icon"`
+	Threshold    float64          `json:"threshold"`
+	CooldownMs   int              `json:"cooldownMs"`
+	Profile      string           `json:"profile"`
+	Tags         []string         `json:"tags"`
+	Note         string           `json:"note"`
+	DisplayHints []DisplayHintDTO `json:"displayHints"`
+	SampleCount  int              `json:"sampleCount"`
+	TotalLenS    float64          `json:"totalLenS"`
+	CreatedAt    time.Time        `json:"createdAt"`
+	UpdatedAt    time.Time        `json:"updatedAt"`
+	IconURL      string           `json:"iconUrl"`
 }
 
 // DisplayHintDTO is one grid→name row with an optional icon URL.
@@ -977,18 +991,18 @@ type LibraryDTO struct {
 
 func (s *Server) itemDTO(it *library.Item) ItemDetailDTO {
 	base := ItemDTO{
-		ID:           it.ID,
-		Name:         it.Name,
-		Icon:         it.Icon,
-		Threshold:    it.Threshold,
-		CooldownMs:   it.CooldownMs,
-		Profile:      it.Profile,
-		Tags:         append([]string{}, it.Tags...),
-		Note:         it.Note,
-		SampleCount:  len(it.Samples),
-		CreatedAt:    it.CreatedAt,
-		UpdatedAt:    it.UpdatedAt,
-		IconURL:      "/api/items/" + it.ID + "/icon.png",
+		ID:          it.ID,
+		Name:        it.Name,
+		Icon:        it.Icon,
+		Threshold:   it.Threshold,
+		CooldownMs:  it.CooldownMs,
+		Profile:     it.Profile,
+		Tags:        append([]string{}, it.Tags...),
+		Note:        it.Note,
+		SampleCount: len(it.Samples),
+		CreatedAt:   it.CreatedAt,
+		UpdatedAt:   it.UpdatedAt,
+		IconURL:     "/api/items/" + it.ID + "/icon.png",
 	}
 	base.DisplayHints = make([]DisplayHintDTO, 0, len(it.DisplayHints))
 	for i, h := range it.DisplayHints {
@@ -1164,6 +1178,54 @@ func parseDisplayHintsForm(raw string) []library.DisplayHint {
 		return nil
 	}
 	return hints
+}
+
+func readHintIconFiles(r *http.Request) ([][]byte, error) {
+	if r == nil || r.MultipartForm == nil {
+		return nil, nil
+	}
+	max := -1
+	for i := 0; i < library.MaxDisplayHints; i++ {
+		if _, ok := r.MultipartForm.File[fmt.Sprintf("hintIcon%d", i)]; ok {
+			max = i
+		}
+	}
+	if max < 0 {
+		return nil, nil
+	}
+	out := make([][]byte, max+1)
+	for i := 0; i <= max; i++ {
+		f, hdr, err := r.FormFile(fmt.Sprintf("hintIcon%d", i))
+		if err != nil {
+			continue
+		}
+		raw, rerr := library.ReadAllLimited(f, maxIconBytes)
+		f.Close()
+		if rerr != nil {
+			return nil, fmt.Errorf("对照图 %d 读取失败: %w", i+1, rerr)
+		}
+		png, rerr := library.ScaleIconNamed(raw, hdr.Filename)
+		if rerr != nil {
+			return nil, fmt.Errorf("对照图 %d: %w", i+1, rerr)
+		}
+		out[i] = png
+	}
+	return out, nil
+}
+
+func (s *Server) applyHintIcons(r *http.Request, id string, nHints int) error {
+	pngs, err := readHintIconFiles(r)
+	if err != nil {
+		return err
+	}
+	if len(pngs) == 0 || nHints == 0 {
+		return nil
+	}
+	if len(pngs) > nHints {
+		pngs = pngs[:nHints]
+	}
+	_, err = s.store.SetHintIcons(id, pngs)
+	return err
 }
 
 type statusRecorder struct {

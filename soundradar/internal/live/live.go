@@ -119,8 +119,10 @@ type ScoreSink interface{ OnTick(t Tick) }
 type Tick struct {
 	Time      time.Time
 	LevelDBFS float64
-	Top       []index.ItemScore
-	Event     *match.Event
+	// DenoisedDBFS is LevelDBFS after the latest frame's noise-reduction gain.
+	DenoisedDBFS float64
+	Top          []index.ItemScore
+	Event        *match.Event
 
 	// Silent reports that this tick reused the previous ranking because the
 	// window was below the silence gate (Top is then the last scored one).
@@ -549,6 +551,11 @@ func (e *Engine) processAll(pcm []float32) {
 	}
 }
 
+// windowLevelMarginDB is how far the loudest frame in the feature window must
+// sit above the silence gate before that window is scored on the strength of
+// the frame alone. See process.
+const windowLevelMarginDB = 6.0
+
 // process analyses one delivered block and scores every hop it completes.
 //
 // The counters are updated as the work happens (not at the end of the block),
@@ -587,12 +594,21 @@ func (e *Engine) process(blk []float32) {
 			// the gate follows the ambience instead of the fixed -60 dBFS, so a
 			// noisy game stops scoring (and reporting) empty windows while a
 			// quiet one keeps the configured sensitivity. It is pushed at most
-			// once per block, and only when it actually moved, so the matcher's
+			// once per hop, and only when it actually moved, so the matcher's
 			// hot path stays untouched.
 			if e.adaptive {
 				e.adaptGate()
 			}
-			ev, top := e.matcher.Tick(w, level, e.stamp(pos))
+			// A short click leaves the 50 ms meter before the 187 ms patch is
+			// centred on it, so the meter is already back in the bed at the
+			// window that would match. Score that window when its loudest frame
+			// is clearly above the gate. A frame only a hair over the gate is
+			// the bed itself.
+			scoreLevel := level
+			if wlv := e.an.WindowLevelDBFS(); wlv > scoreLevel && wlv >= e.GateDBFS()+windowLevelMarginDB {
+				scoreLevel = wlv
+			}
+			ev, top := e.matcher.Tick(w, scoreLevel, e.stamp(pos))
 			if top != nil {
 				e.lastTop, e.lastSilent = top, false
 			} else {
@@ -661,13 +677,14 @@ func (e *Engine) emitTick(pos int64, level float64, ev *match.Event) {
 		return
 	}
 	e.onTick(Tick{
-		Time:      e.stamp(pos),
-		LevelDBFS: level,
-		Top:       e.lastTop,
-		Event:     ev,
-		Silent:    e.lastSilent,
-		AudioTime: e.audioTime(pos),
-		Stats:     e.Stats(),
+		Time:         e.stamp(pos),
+		LevelDBFS:    level,
+		DenoisedDBFS: e.an.DenoisedLevelDBFS(),
+		Top:          e.lastTop,
+		Event:        ev,
+		Silent:       e.lastSilent,
+		AudioTime:    e.audioTime(pos),
+		Stats:        e.Stats(),
 	})
 }
 

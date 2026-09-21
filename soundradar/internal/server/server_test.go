@@ -711,3 +711,109 @@ func TestLittleEndianCheck(t *testing.T) {
 		t.Fatalf("fixture sample rate is not 48000")
 	}
 }
+
+func TestHintIconsCreateAndPatch(t *testing.T) {
+	ts, st := newTestServer(t)
+	pngA := makePNG(t, 40, 80)
+	pngB := makePNG(t, 60, 60)
+	body, ctype := multipartBody(t,
+		map[string]struct {
+			Name string
+			Data []byte
+		}{
+			"audio":     {Name: "beep.wav", Data: makeWAV(t, 48000, 1, 0.3, 880, 0.6)},
+			"hintIcon0": {Name: "a.png", Data: pngA},
+			"hintIcon1": {Name: "b.png", Data: pngB},
+		},
+		map[string]string{
+			"name":         "同音对照",
+			"displayHints": `[{"grid":"3x2","name":"泥板"},{"grid":"2x2","name":"理想国"}]`,
+		})
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/api/items", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", ctype)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+	if res.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /api/items -> %d %s", res.StatusCode, raw)
+	}
+	var created ItemDetailDTO
+	if err := json.Unmarshal(raw, &created); err != nil {
+		t.Fatal(err)
+	}
+	if len(created.DisplayHints) != 2 {
+		t.Fatalf("hints = %+v", created.DisplayHints)
+	}
+	if created.DisplayHints[0].IconURL == "" || created.DisplayHints[1].IconURL == "" {
+		t.Fatalf("每行都应有对照图 URL: %+v", created.DisplayHints)
+	}
+
+	it := st.Get(created.ID)
+	if it == nil || len(it.HintIcon(0)) == 0 || len(it.HintIcon(1)) == 0 {
+		t.Fatal("库里没有按行存下对照图")
+	}
+	if bytes.Equal(it.HintIcon(0), it.HintIcon(1)) {
+		t.Fatal("两行对照图不应相同")
+	}
+
+	icon0 := doGETBytes(t, ts.URL+created.DisplayHints[0].IconURL)
+	if _, err := png.Decode(bytes.NewReader(icon0)); err != nil {
+		t.Fatalf("hint 0 不是 PNG: %v", err)
+	}
+
+	pngC := makePNG(t, 32, 96)
+	pbody, pctype := multipartBody(t,
+		map[string]struct {
+			Name string
+			Data []byte
+		}{
+			"hintIcon0": {Name: "c.png", Data: pngC},
+		},
+		map[string]string{
+			"patch": `{"displayHints":[{"grid":"3x2","name":"泥板"},{"grid":"2x2","name":"理想国"}]}`,
+		})
+	preq, err := http.NewRequest(http.MethodPatch, ts.URL+"/api/items/"+created.ID, pbody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preq.Header.Set("Content-Type", pctype)
+	pres, err := http.DefaultClient.Do(preq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	praw, _ := io.ReadAll(pres.Body)
+	pres.Body.Close()
+	if pres.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH -> %d %s", pres.StatusCode, praw)
+	}
+	it = st.Get(created.ID)
+	if len(it.HintIcon(1)) == 0 {
+		t.Fatal("只改第 0 行时第 1 行的图应保留")
+	}
+	if bytes.Equal(it.HintIcon(0), it.HintIcon(1)) {
+		t.Fatal("替换第 0 行后两行仍不应相同")
+	}
+}
+
+func doGETBytes(t *testing.T, url string) []byte {
+	t.Helper()
+	res, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	defer res.Body.Close()
+	raw, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s -> %d %s", url, res.StatusCode, raw)
+	}
+	return raw
+}

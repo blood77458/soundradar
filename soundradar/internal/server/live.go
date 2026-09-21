@@ -78,10 +78,10 @@ type LiveStarter func(cfg LiveConfig) (live.FrameSource, error)
 type liveHub struct {
 	srv *Server
 
-	mu        sync.Mutex
-	eng       *live.Engine
-	cancel    context.CancelFunc
-	done      chan struct{}
+	mu     sync.Mutex
+	eng    *live.Engine
+	cancel context.CancelFunc
+	done   chan struct{}
 	// gen identifies the running session. A forced stop bumps it so a late
 	// engine exit cannot clear a session that was started afterwards.
 	gen       uint64
@@ -175,13 +175,14 @@ const overlayHitMaxRunes = 72
 
 // TickDTO is the SSE "tick" payload (also embedded in GET /api/live).
 type TickDTO struct {
-	Time      time.Time `json:"t"`
-	AudioMs   float64   `json:"audioMs"`
-	LevelDBFS *float64  `json:"level"`
-	Silent    bool      `json:"silent"`
-	Top       []HitDTO  `json:"top"`
-	Event     *EventDTO `json:"event"`
-	Stats     StatsDTO  `json:"stats"`
+	Time         time.Time `json:"t"`
+	AudioMs      float64   `json:"audioMs"`
+	LevelDBFS    *float64  `json:"level"`
+	DenoisedDBFS *float64  `json:"denoised"`
+	Silent       bool      `json:"silent"`
+	Top          []HitDTO  `json:"top"`
+	Event        *EventDTO `json:"event"`
+	Stats        StatsDTO  `json:"stats"`
 }
 
 type tickDTO = TickDTO
@@ -815,12 +816,13 @@ func (h *liveHub) onEvent(ev match.Event) {
 
 func (h *liveHub) tickToDTO(tk live.Tick) TickDTO {
 	dto := TickDTO{
-		Time:      tk.Time,
-		AudioMs:   float64(tk.AudioTime.Microseconds()) / 1000,
-		LevelDBFS: finitePtr(tk.LevelDBFS),
-		Silent:    tk.Silent,
-		Top:       make([]HitDTO, 0, len(tk.Top)),
-		Stats:     statsToDTO(tk.Stats, true),
+		Time:         tk.Time,
+		AudioMs:      float64(tk.AudioTime.Microseconds()) / 1000,
+		LevelDBFS:    finitePtr(tk.LevelDBFS),
+		DenoisedDBFS: finitePtr(tk.DenoisedDBFS),
+		Silent:       tk.Silent,
+		Top:          make([]HitDTO, 0, len(tk.Top)),
+		Stats:        statsToDTO(tk.Stats, true),
 	}
 	for _, s := range tk.Top {
 		dto.Top = append(dto.Top, HitDTO{
@@ -1110,4 +1112,3 @@ func fingerprintOf(ix *index.Index) string {
 	}
 	return ix.Fingerprint()
 }
-

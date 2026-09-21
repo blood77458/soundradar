@@ -144,9 +144,19 @@ main { padding: 20px; max-width: 1500px; margin: 0 auto; }
 .status.err { color: var(--danger); }
 .status.ok { color: var(--ok); }
 .hint { color: var(--dim); font-size: 11px; }
-.hintRows { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
-.hintRow { display: grid; grid-template-columns: 88px 1fr auto; gap: 8px; align-items: center; }
+.hintRows { display: flex; flex-direction: column; gap: 8px; margin: 8px 0; }
+.hintRow { display: grid; grid-template-columns: 56px 88px 1fr auto; gap: 8px; align-items: center; }
 .hintRow input { width: 100%; }
+.hintThumb {
+  width: 48px; height: 48px; padding: 0; border-radius: 8px;
+  border: 1.5px dashed var(--line); background: var(--bg); cursor: pointer;
+  display: flex; align-items: center; justify-content: center; overflow: hidden;
+}
+.hintThumb:hover { border-color: var(--accent); }
+.hintThumb img { width: 100%; height: 100%; object-fit: contain; display: none; }
+.hintThumb:not(.empty) { border-style: solid; border-color: var(--line); }
+.hintThumb:not(.empty) img { display: block; }
+.hintThumb.empty::after { content: '+'; color: var(--dim); font-size: 18px; line-height: 1; }
 .cardHints { color: var(--dim); font-size: 11px; margin-top: 4px; line-height: 1.35; }
 
 /* ---------- drop zones ---------- */
@@ -230,6 +240,9 @@ table.samples audio { height: 32px; max-width: 260px; }
   color: var(--dim); font-size: 12px; margin-bottom: 6px;
 }
 .levelHead .mono { font-size: 22px; color: var(--fg); }
+.levelSub { margin-top: 8px; }
+.levelSub .mono { font-size: 16px; }
+.meterSub { height: 22px; }
 .meter {
   position: relative; height: 34px; background: #0d1014;
   border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
@@ -238,6 +251,9 @@ table.samples audio { height: 32px; max-width: 260px; }
   position: absolute; inset: 0 auto 0 0; width: 0%;
   background: linear-gradient(90deg, #2f7fb8 0%, #57d38c 55%, #e8c657 82%, #ff6b6b 100%);
   transition: width .05s linear;
+}
+.meterFillSub {
+  background: linear-gradient(90deg, #1c6b62 0%, #3dbe8c 70%, #8fd18a 100%);
 }
 .meterPeak {
   position: absolute; top: 0; bottom: 0; width: 3px; left: 0;
@@ -314,15 +330,21 @@ ul.events .evActions { margin-left: auto; display: flex; gap: 6px; }
 }
 .hitGuessTitle { font-size: 15px; font-weight: 600; }
 .hitGuessMeta { color: var(--dim); font-size: 12px; }
+.hitGuessGroups { display: flex; flex-direction: column; gap: 14px; }
+.hitGuessGroupLabel {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 13px; font-weight: 600; color: var(--accent);
+  margin-bottom: 8px;
+}
 .hitGuessGrid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  display: flex;
+  flex-wrap: wrap;
   gap: 10px;
 }
 .hitGuessCard {
   display: flex; flex-direction: column; align-items: center; gap: 6px;
   padding: 10px 8px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
-  text-align: center;
+  text-align: center; width: 120px;
 }
 .hitGuessCard img {
   width: 72px; height: 72px; object-fit: contain; background: #0d1014; border-radius: 6px;
