@@ -62,6 +62,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/znz/soundradar/internal/confirm"
 	"github.com/znz/soundradar/internal/dsp"
 	"github.com/znz/soundradar/internal/library"
 	"github.com/znz/soundradar/internal/wav"
@@ -72,7 +73,8 @@ const (
 	// Magic is the 4-byte file signature.
 	Magic = "SRZ1"
 	// FormatVersion is bumped whenever the layout below changes.
-	FormatVersion uint32 = 1
+	// v2 adds per-template confirm embeddings after the thumbnail block.
+	FormatVersion uint32 = 2
 	// DefaultName is the file name used when the caller does not choose one.
 	DefaultName = "index.bin"
 	// MaxNameLen bounds the strings read from a file (defensive limit).
@@ -155,13 +157,15 @@ type ItemInfo struct {
 }
 
 // vec is one quantised template: dim int8 values plus the scale that maps them
-// back to floats (value = int8 * scale).
+// back to floats (value = int8 * scale). confirm holds L2-normalised secondary
+// embeddings (clean + noise-augmented) used by the post-mel confirm gate.
 type vec struct {
 	q           []int8
 	scale       float32
 	item        int    // index into Index.items
 	sampleFile  string // container path of the sample it came from
 	sampleIndex int    // 0-based sample index inside the item
+	confirm     [][]float32
 }
 
 // item is one library entry.
@@ -295,13 +299,26 @@ func BuildWithParams(libraryPath string, p dsp.Params) (*Index, error) {
 				bs.Warnings = append(bs.Warnings, Warning{Item: id, Sample: sampleName, Message: "样本太安静，频谱被压成全零，无法用来打分（把播放音量开大一点再录）"})
 				continue
 			}
+			if why := rejectWeakAnchor(p, samples); why != "" {
+				info.Skipped++
+				bs.Skipped++
+				bs.Warnings = append(bs.Warnings, Warning{Item: id, Sample: sampleName, Message: why})
+				continue
+			}
 			q, scale := Quantize(patch)
+			variants := [][]float32{confirm.MelEmbed(patch)}
+			if noisy, cerr := confirm.EmbedVariants(p, samples); cerr != nil {
+				bs.Warnings = append(bs.Warnings, Warning{Item: id, Sample: sampleName, Message: "二次确认噪声变体跳过: " + cerr.Error()})
+			} else {
+				variants = append(variants, noisy...)
+			}
 			ix.vecs = append(ix.vecs, vec{
 				q:           q,
 				scale:       scale,
 				item:        ii,
 				sampleFile:  sampleName,
 				sampleIndex: si,
+				confirm:     variants,
 			})
 			ix.items[ii].thumb = anchor
 			info.Samples++
@@ -512,6 +529,53 @@ func patchUsable(patch []float32) bool {
 	return false
 }
 
+// rejectWeakAnchor skips long, low-contrast templates (typical bad F8 recalls
+// that locked onto BGM). Short clips are left alone: the whole file is often
+// the SFX, so peak-vs-bed is meaningless there.
+func rejectWeakAnchor(p dsp.Params, pcm []float32) string {
+	dur := float64(len(pcm)) / float64(p.SampleRate)
+	if dur <= 0.75 {
+		return ""
+	}
+	peakIdx, energies := anchorFrame(p, pcm)
+	if peakIdx < 0 || len(energies) < 8 {
+		return ""
+	}
+	peak := energies[peakIdx]
+	if peak <= 1e-12 {
+		return "锚点能量过低，跳过（几乎无声）"
+	}
+	sum := 0.0
+	n := 0
+	lo, hi := peakIdx-3, peakIdx+3
+	for i, v := range energies {
+		if i >= lo && i <= hi {
+			continue
+		}
+		sum += v
+		n++
+	}
+	if n == 0 {
+		return ""
+	}
+	bed := sum / float64(n)
+	if bed <= 1e-18 {
+		return ""
+	}
+	// Sustained loud clip (tone / friction): bed already high — not a buried click.
+	if bed > peak*0.25 {
+		return ""
+	}
+	riseDB := 10 * math.Log10(peak/bed)
+	// 9 dB still rejects flat BGM recalls; ~9.9 dB library clips (e.g. 花瓶)
+	// used to miss the old 10 dB cut and never enter the index.
+	const needDB = 9.0
+	if riseDB < needDB {
+		return fmt.Sprintf("长样本锚点起伏不足（峰值仅比背景高 %.1f dB，需要 ≥ %.0f dB）——环境底噪回溯容易误报，已跳过", riseDB, needDB)
+	}
+	return ""
+}
+
 // ---------------------------------------------------------------------------
 // quantisation
 // ---------------------------------------------------------------------------
@@ -642,6 +706,24 @@ func (ix *Index) LibraryName() string {
 
 // Empty reports whether the index holds no templates.
 func (ix *Index) Empty() bool { return len(ix.vecs) == 0 }
+
+// ConfirmScore returns the best cosine between liveEmbed and every confirm
+// variant belonging to item id (across all of its samples). -1 means no data.
+func (ix *Index) ConfirmScore(id string, liveEmbed []float32) float64 {
+	if ix == nil || id == "" || len(liveEmbed) == 0 {
+		return -1
+	}
+	best := -1.0
+	for i := range ix.vecs {
+		if ix.items[ix.vecs[i].item].id != id {
+			continue
+		}
+		if sc := confirm.BestScore(liveEmbed, ix.vecs[i].confirm); sc > best {
+			best = sc
+		}
+	}
+	return best
+}
 
 // ---------------------------------------------------------------------------
 // search
@@ -795,6 +877,21 @@ func (ix *Index) Encode() ([]byte, error) {
 	}
 	for _, it := range ix.items {
 		w.u32(uint32(it.thumb))
+	}
+	// Confirm trailer (format v2): for each template, uint16 variant count,
+	// then each variant is Dim float32 values (little-endian).
+	w.u16(uint16(confirm.Dim))
+	w.u16(uint16(confirm.Version))
+	for _, v := range ix.vecs {
+		w.u16(uint16(len(v.confirm)))
+		for _, emb := range v.confirm {
+			if len(emb) != confirm.Dim {
+				return nil, fmt.Errorf("内部错误: confirm 维数 %d != %d", len(emb), confirm.Dim)
+			}
+			for _, f := range emb {
+				w.f32(f)
+			}
+		}
 	}
 	return buf.Bytes(), w.err
 }
@@ -1079,6 +1176,43 @@ func Decode(raw []byte) (*Index, error) {
 			return nil, err
 		}
 		ix.items[i].thumb = int(thumb)
+	}
+	// Confirm trailer (format v2).
+	cDim, err := r.u16()
+	if err != nil {
+		return nil, fmt.Errorf("缺少二次确认嵌入头: %w", err)
+	}
+	cVer, err := r.u16()
+	if err != nil {
+		return nil, err
+	}
+	if int(cDim) != confirm.Dim {
+		return nil, fmt.Errorf("二次确认维数 %d 与本程序 %d 不一致，请重新执行 index rebuild", cDim, confirm.Dim)
+	}
+	if int(cVer) != confirm.Version {
+		return nil, fmt.Errorf("二次确认版本 %d 不受支持（本程序 %d），请重新执行 index rebuild", cVer, confirm.Version)
+	}
+	for i := range ix.vecs {
+		nv, err := r.u16()
+		if err != nil {
+			return nil, fmt.Errorf("模板 %d 的二次确认数量读取失败: %w", i, err)
+		}
+		if nv > 64 {
+			return nil, fmt.Errorf("模板 %d 的二次确认数量 %d 不合理（文件已损坏）", i, nv)
+		}
+		variants := make([][]float32, 0, nv)
+		for j := 0; j < int(nv); j++ {
+			emb := make([]float32, confirm.Dim)
+			for k := 0; k < confirm.Dim; k++ {
+				f, ferr := r.f32()
+				if ferr != nil {
+					return nil, fmt.Errorf("模板 %d 二次确认向量读取失败: %w", i, ferr)
+				}
+				emb[k] = f
+			}
+			variants = append(variants, emb)
+		}
+		ix.vecs[i].confirm = variants
 	}
 	if r.off != len(raw) {
 		return nil, fmt.Errorf("索引尾部有 %d 字节的多余数据（文件版本或内容不匹配）", len(raw)-r.off)

@@ -406,13 +406,14 @@ func TestLongRunMemoryBounded(t *testing.T) {
 	t.Logf("灌入 %d 块 = %.1f 分钟音频（%.1f s）", st.Blocks, st.AudioSeconds/60, st.AudioSeconds)
 	t.Logf("Analyzer 保留: %d 采样（%.1f KiB）/ %d 帧（上界 %d / %d）",
 		bufferedSamples, float64(bufferedSamples)*4/1024, bufferedFrames,
-		eng.Params().FrameSize+eng.Params().HopSize, 2*eng.Params().WindowFrames)
+		eng.Params().FrameSize+(eng.Params().WindowFrames-1)*eng.Params().HopSize, 2*eng.Params().WindowFrames)
 	t.Logf("HeapInuse: 第 1 分钟 %d KiB -> 第 %d 分钟 %d KiB（差 %d KiB）",
 		heapAtOneMinute/1024, minutes, heapAtEnd/1024, int64(heapAtEnd-heapAtOneMinute)/1024)
 	t.Logf("处理耗时: 平均 %.3f ms/块，峰值 %.3f ms，每 20 ms 音频 %.3f ms（预算 %.1f ms）",
 		st.AvgBlockMs, st.MaxBlockMs, st.MsPer20msAudio, RealtimeBudgetMs)
 
-	if maxS := eng.Params().FrameSize + eng.Params().HopSize; bufferedSamples > maxS {
+	maxS := eng.Params().FrameSize + (eng.Params().WindowFrames-1)*eng.Params().HopSize
+	if bufferedSamples > maxS {
 		t.Fatalf("Analyzer 保留了 %d 个采样，超过上界 %d：内存随时间线性增长", bufferedSamples, maxS)
 	}
 	if maxF := 2 * eng.Params().WindowFrames; bufferedFrames > maxF {

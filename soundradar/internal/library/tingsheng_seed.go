@@ -104,7 +104,7 @@ func (s *Store) SeedTingshengClasses() (SeedTingshengResult, error) {
 		}
 		it := &Item{
 			Name:         cls.Name,
-			Threshold:    0.72,
+			Threshold:    0.80,
 			CooldownMs:   400,
 			Profile:      "default",
 			Tags:         []string{"同音类", "听声鉴宝"},

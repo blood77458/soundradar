@@ -210,9 +210,12 @@ func runLive(args []string) error {
 		}
 	}
 	opts := live.Options{
-		TopN:         *topN,
-		SilenceDBFS:  match.DefaultOptions().SilenceDBFS,
-		AdaptiveGate: liveParams.EffectiveNoise().AdaptiveGate,
+		TopN:            *topN,
+		SilenceDBFS:     match.DefaultOptions().SilenceDBFS,
+		AdaptiveGate:    liveParams.EffectiveNoise().AdaptiveGate,
+		ConfirmEnabled:  liveCfg.Confirm.Enabled,
+		ConfirmMinScore: liveCfg.Confirm.MinScore,
+		ConfirmOnsetDB:  liveCfg.Confirm.OnsetDB,
 	}
 	if rec.Enabled() {
 		opts.OnBlock = rec.Buffer

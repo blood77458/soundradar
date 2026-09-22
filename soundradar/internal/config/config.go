@@ -170,6 +170,20 @@ type NoiseConfig struct {
 	GateFloorDBFS float64 `json:"gateFloorDbfs"`
 }
 
+// ConfirmConfig is the secondary embedding gate that runs after a mel hit.
+// Mel remains the realtime scorer; confirm only fires on provisional hits and
+// rejects ambience false positives using multi-patch embeddings (plus
+// index-time noise variants). Pure Go — no ONNX.
+type ConfirmConfig struct {
+	// Enabled turns the gate on. Default true for new installs.
+	Enabled bool `json:"enabled"`
+	// MinScore is the minimum confirm cosine (0..1). Default 0.52.
+	MinScore float64 `json:"minScore"`
+	// OnsetDB is the minimum recent energy rise in dB before confirm runs.
+	// 0 disables the onset check. Default 2.5.
+	OnsetDB float64 `json:"onsetDb"`
+}
+
 // Config is the whole document.
 type Config struct {
 	Capture CaptureConfig `json:"capture"`
@@ -177,6 +191,7 @@ type Config struct {
 	Hotkeys HotkeyConfig  `json:"hotkeys"`
 	Recall  RecallConfig  `json:"recall"`
 	Noise   NoiseConfig   `json:"noise"`
+	Confirm ConfirmConfig `json:"confirm"`
 	Profile string        `json:"profile"`
 }
 
@@ -210,7 +225,17 @@ func Default() *Config {
 			MaxFiles: 200,
 		},
 		Noise:   DefaultNoiseConfig(),
+		Confirm: DefaultConfirmConfig(),
 		Profile: "default",
+	}
+}
+
+// DefaultConfirmConfig returns the recommended secondary-embedding gate.
+func DefaultConfirmConfig() ConfirmConfig {
+	return ConfirmConfig{
+		Enabled:  true,
+		MinScore: 0.62,
+		OnsetDB:  2.5,
 	}
 }
 
@@ -525,6 +550,15 @@ func (c *Config) Validate() error {
 	if n.GateFloorDBFS > -20 || n.GateFloorDBFS < -100 {
 		return fmt.Errorf("noise.gateFloorDbfs 应在 -100–-20，当前 %v", n.GateFloorDBFS)
 	}
+
+	// --- confirm (secondary embedding) ------------------------------------
+	cf := normalizedConfirm(c.Confirm)
+	if cf.MinScore < 0.1 || cf.MinScore > 0.99 {
+		return fmt.Errorf("confirm.minScore 应在 0.1–0.99，当前 %v", cf.MinScore)
+	}
+	if cf.OnsetDB < 0 || cf.OnsetDB > 40 {
+		return fmt.Errorf("confirm.onsetDb 应在 0–40，当前 %v", cf.OnsetDB)
+	}
 	return nil
 }
 
@@ -635,6 +669,7 @@ func normalize(c *Config) {
 	// Noise: an absent section or an empty method means "recommended default",
 	// so a config.json written before this feature keeps working.
 	c.Noise = normalizedNoise(c.Noise)
+	c.Confirm = normalizedConfirm(c.Confirm)
 }
 
 // NoiseMethods lists every accepted value of NoiseConfig.Method, in the order
@@ -681,6 +716,22 @@ func normalizedNoise(n NoiseConfig) NoiseConfig {
 		n.GateFloorDBFS = d.GateFloorDBFS
 	}
 	return n
+}
+
+// normalizedConfirm fills zero numeric fields. An all-zero ConfirmConfig (old
+// config.json without this section) becomes the recommended defaults.
+//
+// onsetDb 0 is meaningful while confirm is enabled: it disables the energy-rise
+// check (see confirm.OnsetOK). Do not rewrite it to the default.
+func normalizedConfirm(c ConfirmConfig) ConfirmConfig {
+	d := DefaultConfirmConfig()
+	if c.MinScore == 0 && c.OnsetDB == 0 && !c.Enabled {
+		return d
+	}
+	if c.MinScore == 0 {
+		c.MinScore = d.MinScore
+	}
+	return c
 }
 
 // Noise docs: the recognition pipeline reads these.

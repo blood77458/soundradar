@@ -1167,6 +1167,7 @@ function bindSettings() {
   $('btnSaveHotkey').onclick = saveHotkey;
   $('btnSaveRecall').onclick = saveRecall;
   $('btnSaveNoise').onclick = saveNoise;
+  if ($('btnSaveConfirm')) $('btnSaveConfirm').onclick = saveConfirm;
   $('setSize').oninput = () => { $('setSizeText').textContent = $('setSize').value + ' px'; };
   $('setOpacity').oninput = () => { $('setOpacityText').textContent = Number($('setOpacity').value).toFixed(2); };
 }
@@ -1284,6 +1285,15 @@ function applyConfigToForm(cfg) {
   setText('setNoiseState',
     `当前：${n.method || 'subtract'}　高通 ${numText(n.highPassHz)} Hz　强度 ${numText(n.strength)}　` +
     `自适应门限 ${n.adaptiveGate !== false ? '开' : '关'}（裕量 ${numText(n.gateMarginDb)} dB）`);
+
+  const cf = c.confirm || {};
+  if ($('setConfirmEnabled')) {
+    $('setConfirmEnabled').checked = cf.enabled !== false;
+    $('setConfirmMinScore').value = numText(cf.minScore) === '—' ? 0.52 : cf.minScore;
+    $('setConfirmOnset').value = numText(cf.onsetDb) === '—' ? 2.5 : cf.onsetDb;
+    setText('setConfirmState',
+      `二次确认 ${cf.enabled !== false ? '开' : '关'}　阈值 ${numText(cf.minScore)}　起手 ${numText(cf.onsetDb)} dB`);
+  }
 
   $('setConfigPath').textContent = `配置文件：${cfg.path}　·　来源 ${cfg.source}` +
     (cfg.writable ? '' : '　·　不可写');
@@ -1555,6 +1565,26 @@ async function saveNoise() {
       applyConfigToForm(cfg);
     } catch (e) { /* ignore */ }
     banner('环境音设置已保存；若实时识别在跑，请先停止再启动', 'ok');
+  }
+}
+
+/** 保存二次确认（embedding 精排）参数。 */
+async function saveConfirm() {
+  const body = {
+    confirm: {
+      enabled: !!$('setConfirmEnabled').checked,
+      minScore: Number($('setConfirmMinScore').value),
+      onsetDb: Number($('setConfirmOnset').value),
+    },
+  };
+  const ok = await patchConfig(body, 'setConfirmStatus');
+  if (ok) {
+    try {
+      const cfg = await api('/api/config');
+      settings.config = cfg;
+      applyConfigToForm(cfg);
+    } catch (e) { /* ignore */ }
+    banner('二次确认设置已保存；若实时识别在跑，请先停止再启动', 'ok');
   }
 }
 

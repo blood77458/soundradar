@@ -215,6 +215,17 @@ type Options struct {
 	// buffer when the hotkey fires. It must not block: the P4 implementation
 	// does one int16 conversion plus one slice copy.
 	OnBlock func(block []float32)
+
+	// ConfirmEnabled turns on the secondary embedding gate (mel still scores;
+	// confirm only runs when mel is about to fire). Default false so a zero
+	// Options keeps legacy behaviour; the app enables it from config.json.
+	ConfirmEnabled bool
+	// ConfirmMinScore is the minimum cosine of the confirm embedding (0..1).
+	// Default 0.52.
+	ConfirmMinScore float64
+	// ConfirmOnsetDB is the minimum frame-energy rise (dB) required before a
+	// confirm is attempted. 0 disables the onset check. Default 2.5.
+	ConfirmOnsetDB float64
 }
 
 func (o Options) withDefaults() Options {
@@ -243,6 +254,9 @@ func (o Options) withDefaults() Options {
 	}
 	mo.TopN = o.TopN
 	o.MatchOptions = mo
+	if o.ConfirmMinScore <= 0 {
+		o.ConfirmMinScore = 0.52
+	}
 	return o
 }
 
@@ -319,7 +333,7 @@ func New(src FrameSource, idx *index.Index, opts Options, onTick func(Tick), onE
 	if tickSamples < 1 {
 		tickSamples = 1
 	}
-	return &Engine{
+	eng := &Engine{
 		src:         src,
 		ix:          idx,
 		params:      p,
@@ -331,8 +345,18 @@ func New(src FrameSource, idx *index.Index, opts Options, onTick func(Tick), onE
 		queue:       make(chan []float32, opts.QueueBlocks),
 		tickSamples: tickSamples,
 		adaptive:    opts.AdaptiveGate,
-		gateDBFS:    opts.MatchOptions.SilenceDBFS,
-	}, nil
+		gateDBFS:    opts.SilenceDBFS,
+	}
+	if opts.ConfirmEnabled && idx != nil {
+		eng.matcher.SetConfirmer(&confirmGate{
+			ix:       idx,
+			an:       an,
+			enabled:  true,
+			minScore: opts.ConfirmMinScore,
+			onsetDB:  opts.ConfirmOnsetDB,
+		})
+	}
+	return eng, nil
 }
 
 // adaptGate recomputes the adaptive silence gate from the analyzer's noise-floor

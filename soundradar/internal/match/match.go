@@ -119,7 +119,9 @@ type peakHold struct {
 	id, name      string
 	score, margin float64
 	level         float64
+	template      int
 	armedAt       time.Time
+	mel           []float32 // copy of the mel patch at the best score
 }
 
 // Engine is the detection + debounce state machine.
@@ -132,6 +134,7 @@ type Engine struct {
 	lastFire   map[string]time.Time
 	lastAny    time.Time
 	hold       *peakHold
+	confirmer  Confirmer
 
 	// diagnostics for the most recent Tick
 	pendingID     string
@@ -140,6 +143,13 @@ type Engine struct {
 	fired         int64
 	skippedSilent int64
 	rejected      int64
+}
+
+// Confirmer is an optional secondary gate called just before an event is
+// committed. Returning false rejects the hit (counted as rejected). A nil
+// confirmer means "always accept" (legacy mel-only behaviour).
+type Confirmer interface {
+	Accept(id string, templateIdx int, melScore float64, melPatch []float32) bool
 }
 
 // NewEngine builds an engine over ix. A nil index is allowed: every Tick then
@@ -166,6 +176,13 @@ func (e *Engine) SetThreshold(id string, v float64) {
 		return
 	}
 	e.thresholds[id] = v
+}
+
+// SetConfirmer installs (or clears) the secondary confirm gate.
+func (e *Engine) SetConfirmer(c Confirmer) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.confirmer = c
 }
 
 // Threshold returns the effective threshold of an item.
@@ -278,6 +295,8 @@ func (e *Engine) Tick(window []float32, levelDBFS float64, now time.Time) (*Even
 			h.margin = margin
 			h.level = levelDBFS
 			h.name = best.Name
+			h.template = best.Score.TemplateIndex()
+			h.mel = cloneMel(window)
 		}
 		drop := same && bestScore < h.score-0.02
 		elapsed := e.opts.PeakHoldMs > 0 &&
@@ -312,13 +331,15 @@ func (e *Engine) Tick(window []float32, levelDBFS float64, now time.Time) (*Even
 
 	// Peak hold disabled → fire on first cross (legacy / unit-test path).
 	if e.opts.PeakHoldMs < 0 {
-		return e.commitLocked(best.ID, best.Name, bestScore, margin, levelDBFS, now), top
+		return e.commitLocked(best.ID, best.Name, bestScore, margin, levelDBFS, best.Score.TemplateIndex(), now, window), top
 	}
 
 	e.hold = &peakHold{
 		id: best.ID, name: best.Name,
 		score: bestScore, margin: margin, level: levelDBFS,
-		armedAt: now,
+		template: best.Score.TemplateIndex(),
+		armedAt:  now,
+		mel:      cloneMel(window),
 	}
 	e.pendingID, e.pendingScore = best.ID, bestScore
 	return nil, top
@@ -330,10 +351,15 @@ func (e *Engine) fireHoldLocked(now time.Time) *Event {
 		return nil
 	}
 	e.hold = nil
-	return e.commitLocked(h.id, h.name, h.score, h.margin, h.level, now)
+	return e.commitLocked(h.id, h.name, h.score, h.margin, h.level, h.template, now, h.mel)
 }
 
-func (e *Engine) commitLocked(id, name string, score, margin, level float64, now time.Time) *Event {
+func (e *Engine) commitLocked(id, name string, score, margin, level float64, templateIdx int, now time.Time, mel []float32) *Event {
+	if e.confirmer != nil && !e.confirmer.Accept(id, templateIdx, score, mel) {
+		e.rejected++
+		e.pendingID, e.pendingScore = id, score
+		return nil
+	}
 	e.lastFire[id] = now
 	e.lastAny = now
 	e.fired++
@@ -346,6 +372,15 @@ func (e *Engine) commitLocked(id, name string, score, margin, level float64, now
 		Time:      now,
 		LevelDBFS: level,
 	}
+}
+
+func cloneMel(w []float32) []float32 {
+	if len(w) == 0 {
+		return nil
+	}
+	out := make([]float32, len(w))
+	copy(out, w)
+	return out
 }
 
 // cooldown returns the per-item cooldown. Per-item overrides live in the index

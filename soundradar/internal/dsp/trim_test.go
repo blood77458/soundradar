@@ -127,7 +127,8 @@ func TestTrimBoundsRetention(t *testing.T) {
 	t.Logf("HeapInuse: 第 1 分钟 %d KiB -> 第 %d 分钟 %d KiB（差 %d KiB）",
 		heapMin1/1024, minutes, heapMin2/1024, int64(heapMin2-heapMin1)/1024)
 
-	if maxSamples := p.FrameSize + p.HopSize; a.BufferedSamples() > maxSamples {
+	maxSamples := p.FrameSize + (p.WindowFrames-1)*p.HopSize
+	if a.BufferedSamples() > maxSamples {
 		t.Fatalf("保留采样数 %d 超过上界 %d：内存随时间增长", a.BufferedSamples(), maxSamples)
 	}
 	if maxFrames := 2 * p.WindowFrames; a.BufferedFrames() > maxFrames {

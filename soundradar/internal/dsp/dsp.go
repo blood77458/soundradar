@@ -925,10 +925,12 @@ func (a *Analyzer) Trim(keepFrames int) {
 	}
 	a.ftot = a.fbase + int64(len(a.frames))
 
-	// Samples: keep one frame plus one hop, which by construction contains the
-	// next frame this Analyzer will emit (Push emits the frame ending at
-	// stot-1, and emitFrameAt reads sring[start-sbase : start-sbase+FrameSize]).
+	// Samples: keep one frame plus one hop for the next emitFrameAt, plus one
+	// mel window of raw PCM for confirm.RecentPCM (NeedSamples == one patch).
 	keep := a.p.FrameSize + a.p.HopSize
+	if n := a.p.FrameSize + (a.p.WindowFrames-1)*a.p.HopSize; n > keep {
+		keep = n
+	}
 	if drop := len(a.sring) - keep; drop > 0 {
 		copy(a.sring, a.sring[drop:])
 		a.sring = a.sring[:keep]
@@ -1138,6 +1140,22 @@ func (a *Analyzer) FrameEnergyAt(i int) float64 {
 
 // FrameEnergyCount returns how many raw frame energies are retained.
 func (a *Analyzer) FrameEnergyCount() int { return len(a.rawEnergy) }
+
+// RecentPCM returns a copy of the last n samples of the audio AS RECEIVED
+// (before the noise front-end). It is what the confirm embedding wants: the
+// same samples the index variants were built from. n <= 0 or an empty ring
+// yields nil.
+func (a *Analyzer) RecentPCM(n int) []float32 {
+	if n <= 0 || len(a.rring) == 0 {
+		return nil
+	}
+	if n > len(a.rring) {
+		n = len(a.rring)
+	}
+	out := make([]float32, n)
+	copy(out, a.rring[len(a.rring)-n:])
+	return out
+}
 
 // FrameEnergy returns the mean-square of the audio of every retained frame
 // measured before the noise front-end, in chronological order, together with the

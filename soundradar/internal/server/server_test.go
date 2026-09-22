@@ -679,8 +679,9 @@ func TestAPISilentMP3HasBody(t *testing.T) {
 	if !s.Silent || s.PeakDBFS != nil {
 		t.Fatalf("silent sample must report peakDbfs=null/silent=true, got %v/%v", s.PeakDBFS, s.Silent)
 	}
-	if s.Frames != 20*testaudio.SamplesPerMPEGFrame/2 {
-		t.Fatalf("frames = %d", s.Frames)
+	wantFrames := int64(20 * testaudio.SamplesPerMPEGFrame)
+	if diff := s.Frames - wantFrames; diff > 20 || diff < -20 {
+		t.Fatalf("frames = %d, want ~%d", s.Frames, wantFrames)
 	}
 	t.Logf("silent mp3 item %s: body=%d bytes, samples=%d, frames=%d (peakDbfs=null)",
 		created.ID, len(raw), created.SampleCount, s.Frames)

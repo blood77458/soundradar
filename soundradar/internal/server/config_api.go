@@ -57,6 +57,7 @@ type patchConfigDTO struct {
 	Hotkeys *hotkeyPatch  `json:"hotkeys"`
 	Recall  *recallPatch  `json:"recall"`
 	Noise   *noisePatch   `json:"noise"`
+	Confirm *confirmPatch `json:"confirm"`
 	Profile *string       `json:"profile"`
 }
 
@@ -82,6 +83,13 @@ type noisePatch struct {
 	AdaptiveGate  *bool    `json:"adaptiveGate"`
 	GateMarginDB  *float64 `json:"gateMarginDb"`
 	GateFloorDBFS *float64 `json:"gateFloorDbfs"`
+}
+
+// confirmPatch is the secondary-embedding gate section of a PATCH body.
+type confirmPatch struct {
+	Enabled  *bool    `json:"enabled"`
+	MinScore *float64 `json:"minScore"`
+	OnsetDB  *float64 `json:"onsetDb"`
 }
 
 type overlayPatch struct {
@@ -299,6 +307,17 @@ func applyConfigPatch(cfg *config.Config, p patchConfigDTO) {
 		}
 		if n.GateFloorDBFS != nil {
 			cfg.Noise.GateFloorDBFS = *n.GateFloorDBFS
+		}
+	}
+	if cf := p.Confirm; cf != nil {
+		if cf.Enabled != nil {
+			cfg.Confirm.Enabled = *cf.Enabled
+		}
+		if cf.MinScore != nil {
+			cfg.Confirm.MinScore = *cf.MinScore
+		}
+		if cf.OnsetDB != nil {
+			cfg.Confirm.OnsetDB = *cf.OnsetDB
 		}
 	}
 

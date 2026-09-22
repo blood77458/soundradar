@@ -237,16 +237,20 @@ func decodeMP3(raw []byte) (Source, []float64, error) {
 		info.SampleRate = dec.SampleRate()
 	}
 
-	step := MPEGFrameSamples * 2
+	// go-mp3 always emits stereo int16 LE. Keep the interleaved layout so
+	// Convert's Downmix can average L+R. Previously only the left channel was
+	// appended while Channels stayed 2, so Downmix halved the duration
+	// (e.g. a 43 s phone recording became ~21 s and the second half was lost).
+	step := MPEGFrameSamples * 2 * 2 // samples/frame * chans * bytes/sample
 	buf := make([]byte, step)
 	var samples []float64
 	for {
 		n, rerr := io.ReadFull(dec, buf)
 		if n > 0 {
-			frames := n / 4 // stereo 16-bit LE
-			for i := 0; i < frames; i++ {
-				l := int16(binary.LittleEndian.Uint16(buf[i*4:]))
-				samples = append(samples, float64(l)/32768)
+			usable := n - (n % 4)
+			for i := 0; i+3 < usable; i += 2 {
+				v := int16(binary.LittleEndian.Uint16(buf[i:]))
+				samples = append(samples, float64(v)/32768)
 			}
 		}
 		if rerr != nil {

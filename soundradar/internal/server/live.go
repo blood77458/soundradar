@@ -577,6 +577,10 @@ func (h *liveHub) start(cfg LiveConfig) error {
 	// The adaptive silence gate comes from config.json's noise section, so the
 	// live link and the index agree on the pipeline.
 	opts.AdaptiveGate = h.srv.params.EffectiveNoise().AdaptiveGate
+	conf := h.srv.currentConfig().Confirm
+	opts.ConfirmEnabled = conf.Enabled
+	opts.ConfirmMinScore = conf.MinScore
+	opts.ConfirmOnsetDB = conf.OnsetDB
 	if cfg.TickMs > 0 {
 		opts.TickEvery = time.Duration(cfg.TickMs) * time.Millisecond
 	}

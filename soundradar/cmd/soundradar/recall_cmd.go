@@ -224,10 +224,13 @@ func runRecall(args []string) error {
 
 	// ---- recognition link (this is what fills the ring) ------------------
 	opts := live.Options{
-		TopN:         1,
-		SilenceDBFS:  match.DefaultOptions().SilenceDBFS,
-		AdaptiveGate: params.EffectiveNoise().AdaptiveGate,
-		OnBlock:      rc.PushBlock,
+		TopN:            1,
+		SilenceDBFS:     match.DefaultOptions().SilenceDBFS,
+		AdaptiveGate:    params.EffectiveNoise().AdaptiveGate,
+		ConfirmEnabled:  cfg.Confirm.Enabled,
+		ConfirmMinScore: cfg.Confirm.MinScore,
+		ConfirmOnsetDB:  cfg.Confirm.OnsetDB,
+		OnBlock:         rc.PushBlock,
 	}
 	eng, err := live.New(src, ix, opts, func(tk live.Tick) {
 		// Keep the "guess" as fresh as the ranking is: the candidate stores
@@ -481,4 +484,3 @@ func printRecallJSON(r recallJSON) error {
 	fmt.Println(string(b))
 	return nil
 }
-

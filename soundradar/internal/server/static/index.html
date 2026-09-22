@@ -510,6 +510,27 @@
       </div>
 
       <div class="panel">
+        <h2>二次确认（mel 保底 + embedding 精排）</h2>
+        <div class="hint">平时仍用 mel 指纹实时打分；只有 mel 即将命中时，才用多段频谱嵌入做一次二次确认，并要求能量有突变。不需要录很多底噪素材，索引构建时会自动合成噪音变体。改设置后请停再开实时识别；索引会在下次识别时自动重建（格式 v2）。</div>
+        <div class="livebar">
+          <label class="check"><input type="checkbox" id="setConfirmEnabled" /> 启用二次确认</label>
+          <div class="field inline small">
+            <label for="setConfirmMinScore">确认阈值（0.1–0.99）</label>
+            <input type="number" id="setConfirmMinScore" min="0.1" max="0.99" step="0.01" />
+          </div>
+          <div class="field inline small">
+            <label for="setConfirmOnset">起手能量上升（dB，0=关闭）</label>
+            <input type="number" id="setConfirmOnset" min="0" max="40" step="0.5" />
+          </div>
+          <div class="liveActions">
+            <button class="btn primary" id="btnSaveConfirm">保存确认设置</button>
+            <span class="status" id="setConfirmStatus"></span>
+          </div>
+        </div>
+        <div class="mono stateLine" id="setConfirmState">—</div>
+      </div>
+
+      <div class="panel">
         <h2>回溯保存（P4：刚才那 3 秒）</h2>
         <div class="livebar">
           <div class="field inline">

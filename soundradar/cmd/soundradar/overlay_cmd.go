@@ -246,9 +246,12 @@ func runOverlay(args []string) error {
 	}
 
 	opts := live.Options{
-		TopN:         5,
-		SilenceDBFS:  match.DefaultOptions().SilenceDBFS,
-		AdaptiveGate: params.EffectiveNoise().AdaptiveGate,
+		TopN:            5,
+		SilenceDBFS:     match.DefaultOptions().SilenceDBFS,
+		AdaptiveGate:    params.EffectiveNoise().AdaptiveGate,
+		ConfirmEnabled:  cfg.Confirm.Enabled,
+		ConfirmMinScore: cfg.Confirm.MinScore,
+		ConfirmOnsetDB:  cfg.Confirm.OnsetDB,
 	}
 	if rec.Enabled() {
 		// The ring is filled from the same blocks the analyzer sees.
